@@ -60,14 +60,13 @@
     <div class="intro-banner" id="introBanner">
       <div class="intro-banner-header">
         <span class="intro-banner-title">Feature Overview</span>
-        <button class="btn btn-ghost btn-sm" id="introCollapseBtn">Hide details ▾</button>
       </div>
       <p class="intro-banner-subtitle">
-        This tool builds AF3x <strong>JSON</strong> inputs for crosslink-aware AlphaFold 3
-        structure prediction. Every section below gives you more than one way to enter your
-        data — pick whichever is fastest for you.
+        This tool helps you build input files for local installations of AlphaFold 3 or AF3x
+        (extends AlphaFold 3 with crosslink support).
       </p>
-      <div class="intro-banner-body" id="introBannerBody">
+      <button class="btn btn-ghost btn-sm intro-details-btn" id="introCollapseBtn">Show details ▸</button>
+      <div class="intro-banner-body" id="introBannerBody" style="display:none">
         <div class="intro-row">
           <span class="intro-tag" style="--tag-color:var(--primary)">Sequences</span>
           <p>Type or paste a sequence directly, upload a <strong>FASTA</strong> file, fetch it
@@ -120,12 +119,17 @@
             <label for="jobName">Job name</label>
             <input type="text" id="jobName" placeholder="my_complex" autocomplete="off">
           </div>
-          <div class="field field-narrow">
-            <label for="modelSeeds">
+          <div class="field field-seeds">
+            <label>
               Seeds
-              <span class="label-hint" data-tip="Enter a number N to generate seeds 1…N, or enter seeds manually, e.g. 1,2,3,4,5">?</span>
+              <span class="label-hint" data-tip="Count: generate seeds 1…N. Exact: use specific seed values, e.g. 5 alone exports [5].">?</span>
             </label>
-            <input type="text" id="modelSeeds" value="1" placeholder="5 or 1,2,3" autocomplete="off">
+            <div class="seed-seg">
+              <button type="button" class="seed-seg-btn active" data-mode="count">Count</button>
+              <button type="button" class="seed-seg-btn" data-mode="specific">Exact</button>
+            </div>
+            <input type="number" id="seedCount" value="1" min="1" max="100" step="1" autocomplete="off">
+            <input type="text" id="seedSpecific" value="" placeholder="1, 3, 7" autocomplete="off" style="display:none">
           </div>
           <div class="field" style="width:72px">
             <label for="inputVersion">
@@ -142,12 +146,14 @@
         <div class="card-header-row">
           <h2 class="card-title">Sequences</h2>
           <span class="seq-count-badge" id="seqCountBadge">0</span>
-          <button class="btn btn-ghost btn-sm" id="importPdbBtn" style="margin-left:auto">
-            Import PDB / mmCIF
-          </button>
-          <button class="btn btn-ghost btn-sm" id="importFastaBtn" title="Import sequences from a FASTA file">
-            Import FASTA
-          </button>
+          <div class="import-dropdown-wrap" style="margin-left:auto">
+            <button class="btn btn-ghost btn-sm" id="importFromBtn">Import from ▾</button>
+            <div class="dropdown" id="import-dropdown" style="display:none">
+              <button class="dropdown-item" id="importPdbBtn">PDB / mmCIF</button>
+              <button class="dropdown-item" id="importFastaBtn">FASTA file</button>
+              <button class="dropdown-item" id="importUniprotBtn">UniProt ID</button>
+            </div>
+          </div>
           <input type="file" id="fasta-import-file-input" accept=".fasta,.fa,.faa,.txt,.seq,.a2m" style="display:none">
           <button class="btn btn-xl-pick btn-sm" id="selectXlBtn" title="Click residues to add crosslink pairs">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">
@@ -208,7 +214,13 @@
       <section class="card" id="crosslinks-card" style="--section-accent:var(--info-blue)">
         <div class="card-header-row">
           <h2 class="card-title">Crosslinks <span class="optional-tag">optional</span></h2>
-          <button class="btn btn-ghost btn-sm" id="crosslinkerPresetsBtn">Presets ▾</button>
+          <div class="card-header-actions">
+            <button class="btn btn-ghost btn-sm" id="importCsvBtn"
+                    title="Only xiNET or xiVIEW CSV exports are accepted — convert other formats (pLink, MeroX, XlinkX, …) beforehand">
+              Import xiNET/xiVIEW CSV ↑
+            </button>
+            <button class="btn btn-ghost btn-sm" id="crosslinkerPresetsBtn">Presets ▾</button>
+          </div>
         </div>
         <p class="card-hint">
           Model crosslinker molecules explicitly between residue pairs. Indices are 1-based.
@@ -222,10 +234,6 @@
         <div id="xl-stats" class="xl-stats" style="display:none"></div>
         <div class="section-actions">
           <button class="btn btn-outline btn-sm" id="addCrosslinkGroupBtn">+ Add crosslinker</button>
-          <button class="btn btn-ghost btn-sm" id="importCsvBtn"
-                  title="Only xiNET or xiVIEW CSV exports are accepted — convert other formats (pLink, MeroX, XlinkX, …) beforehand">
-            Import xiNET/xiVIEW CSV ↑
-          </button>
         </div>
         <div id="presets-dropdown" class="dropdown" style="display:none">
           <div id="presets-list"></div>
@@ -263,11 +271,8 @@
         <button class="btn btn-outline btn-sm" id="addBondBtn" style="margin-top:8px">+ Add bond</button>
       </details>
 
-      <!-- Generate -->
+      <!-- Batch export / Screening -->
       <div class="generate-area">
-        <button class="btn btn-primary btn-large" id="generateBtn">Generate JSON</button>
-
-        <!-- Batch export / Screening -->
         <details id="batchPanel" class="batch-panel" style="display:none">
           <summary class="batch-summary">Batch export / Screening</summary>
           <div class="batch-body">
@@ -335,6 +340,7 @@
 
         <!-- JSON Output -->
         <div class="card output-card">
+          <button class="btn btn-primary btn-generate-main" id="generateBtn">Generate JSON</button>
           <div class="card-header-row output-header">
             <h2 class="card-title">JSON Output</h2>
             <div class="output-actions">
@@ -349,7 +355,7 @@
             <span>Inputs changed — regenerate to update the download</span>
             <button class="stale-regen-btn" onclick="document.getElementById('generateBtn').click()">Regenerate</button>
           </div>
-          <pre id="jsonOutput" class="json-output"><span class="json-placeholder">// Click "Generate JSON" to build output</span></pre>
+          <pre id="jsonOutput" class="json-output"><span class="json-placeholder">// Click "Generate JSON" above to build output</span></pre>
           <div id="json-validation-panel" style="display:none"></div>
         </div>
 
@@ -623,6 +629,35 @@
   </div>
 
   <!-- ─── PDB / mmCIF Import Modal ────────────────────────────────────────── -->
+  <!-- AlphaFold Server JSON import modal -->
+  <div id="server-import-modal" class="modal-overlay" style="display:none"
+       role="dialog" aria-modal="true" aria-label="Import from AlphaFold Server">
+    <div class="modal-box" style="max-width:480px">
+      <div class="modal-header">
+        <h3>Import from AlphaFold Server</h3>
+        <button class="modal-close" id="serverImportClose" aria-label="Close">✕</button>
+      </div>
+      <div style="padding:14px 20px 4px">
+        <div id="serverImportNotes" class="server-import-notes"></div>
+        <div id="serverImportOptions" style="display:none; margin-top:12px">
+          <p style="font-size:12px; color:var(--text-2); margin-bottom:8px">Select what to import:</p>
+          <label id="serverImportMsaRow" class="server-import-option" style="display:none">
+            <input type="checkbox" id="serverImportMsa" checked>
+            <span>Inline MSA <span class="server-import-note">(can be large)</span></span>
+          </label>
+          <label id="serverImportTplRow" class="server-import-option" style="display:none">
+            <input type="checkbox" id="serverImportTpl" checked>
+            <span>Templates <span class="server-import-note">(inline mmCIF + index mappings)</span></span>
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="serverImportCancel">Cancel</button>
+        <button class="btn btn-primary" id="serverImportConfirm">Import</button>
+      </div>
+    </div>
+  </div>
+
   <div id="pdb-modal" class="modal-overlay" style="display:none"
        role="dialog" aria-modal="true" aria-label="Import chains from PDB or mmCIF">
     <div class="modal-box">
@@ -645,6 +680,28 @@
         <button class="btn btn-primary" id="pdbImportConfirm">Import selected</button>
       </div>
 
+    </div>
+  </div>
+
+  <!-- UniProt import modal -->
+  <div id="uniprot-modal" class="modal-overlay" style="display:none"
+       role="dialog" aria-modal="true" aria-label="Import from UniProt">
+    <div class="modal-box" style="max-width:400px">
+      <div class="modal-header">
+        <h3>Import from UniProt</h3>
+        <button class="modal-close" id="uniprotModalClose" aria-label="Close">✕</button>
+      </div>
+      <div style="padding:16px 20px 8px">
+        <div class="uniprot-row">
+          <input type="text" id="uniprotModalInput" class="uniprot-input"
+                 placeholder="e.g. P04637 or Q9Y6K9" autocomplete="off" style="flex:1">
+          <button class="btn btn-primary btn-sm" id="uniprotModalFetchBtn">Fetch</button>
+        </div>
+        <div id="uniprotModalStatus" class="uniprot-status"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="uniprotModalCancel">Cancel</button>
+      </div>
     </div>
   </div>
 

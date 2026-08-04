@@ -172,7 +172,7 @@ function _draw() {
     _drawChainShape(svg, chain.type, ML, y, cw, BAR_H, color, chain.id);
 
     // Chain label with type prefix
-    const TYPE_PREFIX = { protein: '▶ ', rna: '― ', dna: '═ ', ligand: '⬡ ' };
+    const TYPE_PREFIX = { protein: '▶ ', rna: '― ', dna: '─ ', ligand: '⬡ ' };
     const lbl = _el('text');
     _attrs(lbl, { x: ML - 10, y: y + BAR_H / 2 + 5,
                   'text-anchor': 'end', 'font-size': 14,
@@ -185,7 +185,8 @@ function _draw() {
       const hint = _el('text');
       _attrs(hint, { x: ML + cw + 8, y: y + BAR_H / 2 + 5,
                      'text-anchor': 'start', 'font-size': 10, fill: '#9aa0a6' });
-      hint.textContent = chain.type === 'ligand' ? 'ligand' : chain.length + ' aa';
+      const unit = (chain.type === 'rna' || chain.type === 'dna') ? 'nt' : 'aa';
+      hint.textContent = chain.type === 'ligand' ? 'ligand' : chain.length + ' ' + unit;
       svg.appendChild(hint);
     }
   });
@@ -193,24 +194,22 @@ function _draw() {
 
 function _drawChainShape(svg, type, x, y, w, h, color, chainId) {
   if (type === 'dna') {
-    // Full ladder — two rails + vertical rungs between them
+    // Single strand — one rail + downward ticks (distinct from RNA's upward ticks)
     const railH  = Math.max(2, h * 0.18);
-    const topY   = y + h * 0.08;
-    const botY   = y + h * 0.74;
-    const rungH  = botY - (topY + railH);
+    const railY  = y + h * 0.28;
+    const rungH  = h * 0.44;
     const nRungs = Math.max(2, Math.round(w / 13));
     const sp     = w / (nRungs + 1);
 
-    [topY, botY].forEach(ry => {
-      const rail = _el('rect');
-      _attrs(rail, { x, y: ry, width: w, height: railH, rx: railH / 2,
-                     fill: color, opacity: 0.88,
-                     class: 'topo-chain-bar', 'data-chainid': chainId || '' });
-      svg.appendChild(rail);
-    });
+    const rail = _el('rect');
+    _attrs(rail, { x, y: railY, width: w, height: railH, rx: 0,
+                   fill: color, opacity: 0.88,
+                   class: 'topo-chain-bar', 'data-chainid': chainId || '' });
+    svg.appendChild(rail);
+
     for (let i = 1; i <= nRungs; i++) {
       const rung = _el('rect');
-      _attrs(rung, { x: x + i * sp - 1, y: topY + railH,
+      _attrs(rung, { x: x + i * sp - 1, y: railY + railH,
                      width: 2, height: rungH,
                      fill: color, opacity: 0.7 });
       svg.appendChild(rung);
@@ -273,9 +272,9 @@ function _drawArc(svg, pair, color, xlLabel, dashArray, chainW) {
 
   let pathD;
   if (pair.chain1 === pair.chain2) {
-    const yTop = y1 - 10;
-    const arcH = Math.min(MAX_INTRA, Math.max(12, Math.abs(x2 - x1) * 0.35));
-    pathD = `M ${x1} ${yTop} C ${x1} ${yTop - arcH}, ${x2} ${yTop - arcH}, ${x2} ${yTop}`;
+    const dotY = y1 + BAR_H / 2;
+    const arcH = Math.min(MAX_INTRA, Math.max(30, Math.abs(x2 - x1) * 0.35));
+    pathD = `M ${x1} ${dotY} C ${x1} ${dotY - arcH}, ${x2} ${dotY - arcH}, ${x2} ${dotY}`;
   } else {
     const ay1  = y1 + BAR_H / 2;
     const ay2  = y2 + BAR_H / 2;

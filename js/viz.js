@@ -61,7 +61,7 @@ export function drawArcDiagram(svg, chains, xlGroups, ssBonds = []) {
     _drawChainShape(svg, chain.type, MARGIN_LEFT, y, fillW, BAR_HEIGHT, color);
 
     // Chain label with type prefix
-    const TYPE_PREFIX = { protein: '▶ ', rna: '― ', dna: '═ ', ligand: '⬡ ' };
+    const TYPE_PREFIX = { protein: '▶ ', rna: '― ', dna: '─ ', ligand: '⬡ ' };
     const label = _el('text');
     label.setAttribute('x',           MARGIN_LEFT - 8);
     label.setAttribute('y',           y + BAR_HEIGHT / 2 + 4);
@@ -81,7 +81,8 @@ export function drawArcDiagram(svg, chains, xlGroups, ssBonds = []) {
       hint.setAttribute('text-anchor', 'start');
       hint.setAttribute('font-size',   '10');
       hint.setAttribute('fill',        '#9aa0a6');
-      hint.textContent = chain.type === 'ligand' ? 'ligand' : chain.length + ' aa';
+      const unit = (chain.type === 'rna' || chain.type === 'dna') ? 'nt' : 'aa';
+      hint.textContent = chain.type === 'ligand' ? 'ligand' : chain.length + ' ' + unit;
       svg.appendChild(hint);
     }
   });
@@ -118,10 +119,10 @@ function _drawArc(svg, pair, chainRow, chains, chainBarW, maxLen, color, label, 
   let pathD;
 
   if (r1 === r2) {
-    const yTop = yBar1 - 8;
-    const arcH = Math.min(MAX_INTRA_ARC, Math.max(12, Math.abs(x2 - x1) * 0.35));
-    const cy   = yTop - arcH;
-    pathD = `M ${x1} ${yTop} C ${x1} ${cy}, ${x2} ${cy}, ${x2} ${yTop}`;
+    const dotY = yBar1 + BAR_HEIGHT / 2;
+    const arcH = Math.min(MAX_INTRA_ARC, Math.max(30, Math.abs(x2 - x1) * 0.35));
+    const cy   = dotY - arcH;
+    pathD = `M ${x1} ${dotY} C ${x1} ${cy}, ${x2} ${cy}, ${x2} ${dotY}`;
   } else {
     const y1    = yBar1 + BAR_HEIGHT / 2;
     const y2    = yBar2 + BAR_HEIGHT / 2;
@@ -173,26 +174,24 @@ function _drawArc(svg, pair, chainRow, chains, chainBarW, maxLen, color, label, 
 
 function _drawChainShape(svg, type, x, y, w, h, color) {
   if (type === 'dna') {
-    // Full ladder — two rails + vertical rungs between them
+    // Single strand — one rail + downward ticks (distinct from RNA's upward ticks)
     const railH  = Math.max(2, h * 0.18);
-    const topY   = y + h * 0.08;
-    const botY   = y + h * 0.74;
-    const rungH  = botY - (topY + railH);
+    const railY  = y + h * 0.28;
+    const rungH  = h * 0.44;
     const nRungs = Math.max(2, Math.round(w / 13));
     const sp     = w / (nRungs + 1);
 
-    [topY, botY].forEach(ry => {
-      const rail = _el('rect');
-      rail.setAttribute('x', x);    rail.setAttribute('y', ry);
-      rail.setAttribute('width', w); rail.setAttribute('height', railH);
-      rail.setAttribute('rx', railH / 2); rail.setAttribute('fill', color);
-      rail.setAttribute('opacity', '0.85');
-      svg.appendChild(rail);
-    });
+    const rail = _el('rect');
+    rail.setAttribute('x', x); rail.setAttribute('y', railY);
+    rail.setAttribute('width', w); rail.setAttribute('height', railH);
+    rail.setAttribute('rx', 0); rail.setAttribute('fill', color);
+    rail.setAttribute('opacity', '0.85');
+    svg.appendChild(rail);
+
     for (let i = 1; i <= nRungs; i++) {
       const rung = _el('rect');
       rung.setAttribute('x',      x + i * sp - 1);
-      rung.setAttribute('y',      topY + railH);
+      rung.setAttribute('y',      railY + railH);
       rung.setAttribute('width',  2);
       rung.setAttribute('height', rungH);
       rung.setAttribute('fill',   color);

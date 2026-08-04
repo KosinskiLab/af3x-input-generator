@@ -114,10 +114,29 @@ document.addEventListener('DOMContentLoaded', () => {
     openInteractiveTopology(chains, xlGroups, ssBonds);
   });
 
-  // PDB / mmCIF import
+  // Import from ▾ dropdown
+  const importFromBtn  = document.getElementById('importFromBtn');
+  const importDropdown = document.getElementById('import-dropdown');
+  importFromBtn?.addEventListener('click', e => {
+    e.stopPropagation();
+    const open = importDropdown.style.display !== 'none';
+    importDropdown.style.display = open ? 'none' : 'block';
+  });
+  document.addEventListener('click', () => { if (importDropdown) importDropdown.style.display = 'none'; });
+
   document.getElementById('importPdbBtn').addEventListener('click', () => {
+    importDropdown.style.display = 'none';
     document.getElementById('pdbFileInput').click();
   });
+  document.getElementById('importFastaBtn').addEventListener('click', () => {
+    importDropdown.style.display = 'none';
+    document.getElementById('fasta-import-file-input').click();
+  });
+  document.getElementById('importUniprotBtn').addEventListener('click', () => {
+    importDropdown.style.display = 'none';
+    _openUniprotModal();
+  });
+
   document.getElementById('pdbFileInput').addEventListener('change', _handlePdbFile);
 
   // "Select XL residues" toggle button
@@ -153,8 +172,28 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // Seed mode toggle
+  document.querySelectorAll('.seed-seg-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.seed-seg-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const isCount = btn.dataset.mode === 'count';
+      document.getElementById('seedCount').style.display    = isCount ? '' : 'none';
+      document.getElementById('seedSpecific').style.display = isCount ? 'none' : '';
+    });
+  });
+
   // Global FASTA import
   _initGlobalFastaImport();
+
+  // Sequence card reordering
+  _initSeqReorder();
+
+  // UniProt import modal
+  _initUniprotModal();
+
+  // AlphaFold Server import modal
+  _initServerImportModal();
 
   // localStorage restore banner
   _checkRestoreSession();
@@ -256,15 +295,17 @@ export function addSequenceCard(type) {
     <div class="seq-card-main">
 
       <div class="seq-left">
-        <span class="drag-handle">⠿</span>
+        <span class="drag-handle" title="Drag to reorder">⠿</span>
         <span class="seq-type-badge" style="background:${color}">${_typeLabel(type)}</span>
         <span class="seq-type-label">${_typeLabel(type)}</span>
         <div class="seq-chain-id-wrap">
-          <label>Chain ID(s)</label>
+          <label>Chain ID</label>
           <input type="text" class="seq-chain-id" placeholder="A" value="${_nextChainId()}"
-                 autocomplete="off" spellcheck="false" data-seqid="${id}">
+                 autocomplete="off" spellcheck="false" data-seqid="${id}" maxlength="4">
           <span class="chain-id-dup-warn" style="display:none" title="Duplicate chain ID">⚠</span>
+          <span class="chain-id-multi-warn" style="display:none" title="Use separate cards for multiple chains">One ID only</span>
         </div>
+        <span class="seq-length-hint"></span>
         <button class="btn-copy-chain" data-seqid="${id}" title="Duplicate chain (new chain ID, no crosslinks)">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
             <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" stroke-width="1.6"/>
@@ -292,6 +333,13 @@ export function addSequenceCard(type) {
 
   // Wire input mode tabs and interactive elements
   _wireSeqInputTabs(card, type, id);
+
+  // Drag-to-reorder: only activate when mousedown on the handle
+  const handle = card.querySelector('.drag-handle');
+  if (handle) {
+    handle.addEventListener('mousedown', () => { card.draggable = true; });
+    card.addEventListener('dragend', () => { card.draggable = false; });
+  }
 
   card.querySelector('.btn-copy-chain').addEventListener('click', () => {
     const seq = card.querySelector('.seq-textarea')?.value || '';
@@ -331,7 +379,14 @@ export function addSequenceCard(type) {
     updateViz();
   });
 
-  card.querySelector('.seq-chain-id').addEventListener('input', updateViz);
+  card.querySelector('.seq-chain-id').addEventListener('input', function() {
+    const warn = card.querySelector('.chain-id-multi-warn');
+    if (this.value.includes(',') || this.value.includes(' ')) {
+      this.value = this.value.replace(/[,\s]+/g, '');
+      if (warn) { warn.style.display = ''; setTimeout(() => { warn.style.display = 'none'; }, 2000); }
+    }
+    updateViz();
+  });
 
   document.getElementById('sequences-container').appendChild(card);
   _updateSeqCount();
@@ -391,11 +446,6 @@ function _sequenceInputBlock(type, id) {
 
   return `
     <div class="seq-body">
-      <div class="input-tabs">
-        <button class="tab-btn active" data-tab="text">Sequence</button>
-        ${type === 'protein' ? '<button class="tab-btn" data-tab="uniprot">UniProt ID</button>' : ''}
-      </div>
-
       <div class="tab-panel active" data-panel="text">
         <div class="seq-editor-wrap">
           <pre class="seq-display" title="Click to edit"></pre>
@@ -403,18 +453,8 @@ function _sequenceInputBlock(type, id) {
                     placeholder="${placeholder}"
                     data-seqid="${id}" spellcheck="false"></textarea>
         </div>
-        <div class="seq-meta"><span class="seq-length-hint"></span><span class="seq-val-msg"></span></div>
+        <div class="seq-meta"><span class="seq-val-msg"></span></div>
       </div>
-
-      ${type === 'protein' ? `
-      <div class="tab-panel" data-panel="uniprot" style="display:none">
-        <div class="uniprot-row">
-          <input type="text" class="uniprot-input" placeholder="e.g. P04637 or Q9Y6K9"
-                 data-seqid="${id}" autocomplete="off">
-          <button class="btn btn-outline btn-sm fetch-uniprot-btn" data-seqid="${id}">Fetch</button>
-        </div>
-        <div class="uniprot-status" data-seqid="${id}"></div>
-      </div>` : ''}
     </div>`;
 }
 
@@ -538,6 +578,7 @@ function _advancedBlock(type, id) {
         <p class="adv-hint msa-path-hint">Enter a file path for cluster use
           (<code>unpairedMsaPath</code>), or upload a local .a3m file
           (embedded inline as <code>unpairedMsa</code>). Path takes priority over upload.</p>
+        <p class="msa-val-msg" data-seqid="${id}" style="display:none"></p>
       </div>
     </div>`;
 
@@ -774,16 +815,6 @@ function _wireSeqInputTabs(card, type, id) {
     });
   }
 
-  // UniProt fetch
-  const fetchBtn = card.querySelector('.fetch-uniprot-btn');
-  if (fetchBtn) {
-    fetchBtn.addEventListener('click', () => _fetchUniProt(card, type, id));
-    const uniInput = card.querySelector('.uniprot-input');
-    if (uniInput) {
-      uniInput.addEventListener('keydown', e => { if (e.key === 'Enter') _fetchUniProt(card, type, id); });
-    }
-  }
-
   // Modification button
   const addModBtn = card.querySelector('.add-mod-btn');
   if (addModBtn) {
@@ -861,6 +892,23 @@ function _wireSeqInputTabs(card, type, id) {
     }
 
     // File upload: unpaired
+    const _showMsaVal = (msgs, isError) => {
+      const el = card.querySelector(`.msa-val-msg[data-seqid="${id}"]`);
+      if (!el) return;
+      if (!msgs.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+      el.style.display = 'block';
+      el.style.color   = isError ? 'var(--danger)' : 'var(--warning, #b45309)';
+      el.innerHTML     = msgs.map(m => `<div>${isError ? '✗' : '⚠'} ${m}</div>`).join('');
+    };
+
+    const _runMsaValidation = (a3mText, label) => {
+      const chainSeq = (card.querySelector('.seq-textarea')?.value || '').replace(/\s/g, '').toUpperCase();
+      const { errors, warnings } = _validateA3m(a3mText, chainSeq || null);
+      if (errors.length)        _showMsaVal(errors.map(e => `${label}: ${e}`), true);
+      else if (warnings.length) _showMsaVal(warnings.map(w => `${label}: ${w}`), false);
+      else                      _showMsaVal([], false);
+    };
+
     const unpairedFile = card.querySelector('.msa-unpaired-file');
     if (unpairedFile) {
       unpairedFile.addEventListener('change', () => {
@@ -872,6 +920,7 @@ function _wireSeqInputTabs(card, type, id) {
         reader.onload = e => {
           if (pathInput)   { pathInput.value = file.name; pathInput.dataset.isUpload = 'true'; }
           if (contentArea) contentArea.value = e.target.result;
+          _runMsaValidation(e.target.result, 'Unpaired MSA');
           _updateAdvancedSummary(id);
         };
         reader.readAsText(file);
@@ -890,6 +939,7 @@ function _wireSeqInputTabs(card, type, id) {
         reader.onload = e => {
           if (pathInput)   { pathInput.value = file.name; pathInput.dataset.isUpload = 'true'; }
           if (contentArea) contentArea.value = e.target.result;
+          _runMsaValidation(e.target.result, 'Paired MSA');
           _updateAdvancedSummary(id);
         };
         reader.readAsText(file);
@@ -1010,12 +1060,124 @@ function _importFastaEntries(entries) {
   updateViz();
 }
 
-function _initGlobalFastaImport() {
-  const btn   = document.getElementById('importFastaBtn');
-  const input = document.getElementById('fasta-import-file-input');
-  if (!btn || !input) return;
+function _initSeqReorder() {
+  const container = document.getElementById('sequences-container');
+  if (!container) return;
 
-  btn.addEventListener('click', () => input.click());
+  let dragSrc = null;
+
+  container.addEventListener('dragstart', e => {
+    const card = e.target.closest('.seq-card');
+    if (!card || !card.draggable) return;
+    dragSrc = card;
+    card.classList.add('seq-dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+
+  container.addEventListener('dragover', e => {
+    if (!dragSrc) return;
+    const card = e.target.closest('.seq-card');
+    if (!card || card === dragSrc) return;
+    e.preventDefault();
+    const mid = card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
+    container.querySelectorAll('.seq-card').forEach(c => c.classList.remove('drag-over-top', 'drag-over-bottom'));
+    card.classList.add(e.clientY < mid ? 'drag-over-top' : 'drag-over-bottom');
+  });
+
+  container.addEventListener('dragleave', e => {
+    if (!e.target.closest('.seq-card')) return;
+    e.target.closest('.seq-card').classList.remove('drag-over-top', 'drag-over-bottom');
+  });
+
+  container.addEventListener('drop', e => {
+    if (!dragSrc) return;
+    const card = e.target.closest('.seq-card');
+    if (!card || card === dragSrc) { _resetDrag(container, dragSrc); return; }
+    e.preventDefault();
+    const mid = card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
+    container.insertBefore(dragSrc, e.clientY < mid ? card : card.nextSibling);
+    _resetDrag(container, dragSrc);
+    updateViz();
+  });
+
+  container.addEventListener('dragend', () => { _resetDrag(container, dragSrc); dragSrc = null; });
+}
+
+function _resetDrag(container, dragSrc) {
+  if (dragSrc) { dragSrc.draggable = false; dragSrc.classList.remove('seq-dragging'); }
+  container.querySelectorAll('.seq-card').forEach(c => c.classList.remove('drag-over-top', 'drag-over-bottom'));
+}
+
+function _validateA3m(a3mText, querySeq) {
+  const errors   = [];
+  const warnings = [];
+
+  // Parse entries: header lines start with '>'
+  const lines   = a3mText.replace(/\r\n?/g, '\n').split('\n');
+  const entries = [];
+  let cur = null;
+  for (const line of lines) {
+    if (line.startsWith('>')) {
+      if (cur) entries.push(cur);
+      cur = { header: line.slice(1).trim(), seq: '' };
+    } else if (cur) {
+      cur.seq += line.trim();
+    }
+  }
+  if (cur) entries.push(cur);
+
+  if (entries.length === 0) {
+    errors.push('A3M file is empty or contains no valid FASTA entries');
+    return { errors, warnings };
+  }
+
+  // ── First sequence (query) checks ─────────────────────────────────────────
+  const firstSeq = entries[0].seq;
+
+  if (/[a-z]/.test(firstSeq))
+    errors.push('A3M first sequence contains lowercase insertion characters — the query must be uppercase only');
+  if (firstSeq.includes('-'))
+    errors.push('A3M first sequence contains gap characters (-) — the query must not have gaps');
+
+  if (querySeq) {
+    const firstUpper = firstSeq.toUpperCase();
+    if (firstUpper.length !== querySeq.length) {
+      errors.push(`A3M first sequence length (${firstUpper.length}) does not match chain sequence length (${querySeq.length})`);
+    } else if (firstUpper !== querySeq) {
+      let pos = -1;
+      for (let i = 0; i < querySeq.length; i++) {
+        if (firstUpper[i] !== querySeq[i]) { pos = i + 1; break; }
+      }
+      if (pos > 0)
+        errors.push(`A3M first sequence mismatch at position ${pos}: expected ${querySeq[pos-1]}, got ${firstUpper[pos-1]}`);
+    }
+  }
+
+  // ── Subsequent hit checks ──────────────────────────────────────────────────
+  const queryLen = querySeq ? querySeq.length : firstSeq.replace(/[a-z]/g, '').length;
+  let badHits = 0;
+  for (let i = 1; i < entries.length; i++) {
+    const aligned = entries[i].seq.replace(/[a-z]/g, '');
+    if (aligned.length !== queryLen) badHits++;
+  }
+  if (badHits > 0)
+    warnings.push(`${badHits} MSA hit(s) have incorrect alignment length after removing insertions (expected ${queryLen} columns)`);
+
+  return { errors, warnings };
+}
+
+function _looksLikeStructureFile(filename, text) {
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+  if (['pdb', 'cif', 'mmcif', 'ent'].includes(ext)) return true;
+  // Content-based fallback for extensionless or ambiguous files
+  const head = text.trimStart().slice(0, 400);
+  return isMmcifText(text) || /^(ATOM|HETATM|HEADER|REMARK|MODEL|COMPND|SEQRES)\s/m.test(head);
+}
+
+function _initGlobalFastaImport() {
+  const input = document.getElementById('fasta-import-file-input');
+  if (!input) return;
+
   input.addEventListener('change', () => {
     const file = input.files[0];
     if (!file) return;
@@ -1038,7 +1200,14 @@ function _initGlobalFastaImport() {
       const file = e.dataTransfer.files[0];
       if (!file) return;
       const reader = new FileReader();
-      reader.onload = ev => _handleFastaFileContent(ev.target.result);
+      reader.onload = ev => {
+        const text = ev.target.result;
+        if (_looksLikeStructureFile(file.name, text)) {
+          openPdbModal(text, _onPdbImport);
+        } else {
+          _handleFastaFileContent(text);
+        }
+      };
       reader.readAsText(file);
     });
   }
@@ -1049,6 +1218,71 @@ function _initGlobalFastaImport() {
     modal.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
     modal.querySelector('#fasta-select-cancel')?.addEventListener('click', () => { modal.style.display = 'none'; });
   }
+}
+
+function _openUniprotModal() {
+  const modal = document.getElementById('uniprot-modal');
+  if (!modal) return;
+  document.getElementById('uniprotModalInput').value = '';
+  const status = document.getElementById('uniprotModalStatus');
+  status.textContent = '';
+  status.className = 'uniprot-status';
+  modal.style.display = 'flex';
+  document.getElementById('uniprotModalInput').focus();
+}
+
+function _initUniprotModal() {
+  const modal     = document.getElementById('uniprot-modal');
+  const input     = document.getElementById('uniprotModalInput');
+  const fetchBtn  = document.getElementById('uniprotModalFetchBtn');
+  const statusEl  = document.getElementById('uniprotModalStatus');
+  if (!modal) return;
+
+  const close = () => { modal.style.display = 'none'; };
+  document.getElementById('uniprotModalClose')?.addEventListener('click', close);
+  document.getElementById('uniprotModalCancel')?.addEventListener('click', close);
+  modal.addEventListener('click', e => { if (e.target === modal) close(); });
+
+  const doFetch = async () => {
+    const uniId = input.value.trim();
+    if (!uniId) return;
+    fetchBtn.disabled = true;
+    statusEl.textContent = 'Fetching…';
+    statusEl.className = 'uniprot-status loading';
+    try {
+      const url = `https://rest.uniprot.org/uniprotkb/${uniId}.fasta`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`UniProt returned ${res.status}`);
+      const text = await res.text();
+      const seq  = _extractFasta(text);
+      if (!seq) throw new Error('No sequence in response');
+      // Reuse existing empty protein card if there is one, otherwise add new
+      const existingCards = document.querySelectorAll('#sequences-container .seq-card');
+      let targetCard = null;
+      for (const c of existingCards) {
+        if (c.dataset.type === 'protein' && !c.querySelector('.seq-textarea')?.value.trim()) {
+          targetCard = c;
+          break;
+        }
+      }
+      if (!targetCard) {
+        addSequenceCard('protein');
+        const all = document.querySelectorAll('#sequences-container .seq-card');
+        targetCard = all[all.length - 1];
+      }
+      _setSeqAndSwitchToText(targetCard, seq, 'protein');
+      targetCard?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      close();
+    } catch (err) {
+      statusEl.textContent = `✗ ${err.message}`;
+      statusEl.className = 'uniprot-status error';
+    } finally {
+      fetchBtn.disabled = false;
+    }
+  };
+
+  fetchBtn.addEventListener('click', doFetch);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') doFetch(); });
 }
 
 function _handleFastaFileContent(text) {
@@ -2316,14 +2550,192 @@ function _initJsonImport() {
   // handled via event listener in DOMContentLoaded
 }
 
+function _detectJsonDialect(raw) {
+  if (Array.isArray(raw)) return 'alphafoldserver';
+  if (raw.dialect === 'alphafoldserver') return 'alphafoldserver';
+  if (raw.sequences) return 'af3x';
+  return 'unknown';
+}
+
+function _stripCcd(code) {
+  return typeof code === 'string' ? code.replace(/^CCD_/i, '') : code;
+}
+
+function _convertServerJson(raw) {
+  const jobs = Array.isArray(raw) ? raw : [raw];
+  const job = jobs[0];
+  const w = []; // warnings
+
+  w.push('Converted from AlphaFold Server format.');
+  if (jobs.length > 1) {
+    w.push(`File contains ${jobs.length} jobs — only the first was imported.`);
+  }
+
+  const converted = { name: job.name || '', version: 2 };
+
+  // Seeds: server uses strings or empty array → default to [1]
+  const rawSeeds = Array.isArray(job.modelSeeds) ? job.modelSeeds : [];
+  converted.modelSeeds = rawSeeds.map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  if (!converted.modelSeeds.length) converted.modelSeeds = [1];
+
+  const usedIds = new Set();
+  const nextId = () => {
+    for (let i = 0; i < 26; i++) {
+      const c = String.fromCharCode(65 + i);
+      if (!usedIds.has(c)) { usedIds.add(c); return c; }
+    }
+    return '?';
+  };
+
+  // Convert modifications array, stripping CCD_ prefix
+  const convertMods = (mods, isProtein) => {
+    if (!Array.isArray(mods) || !mods.length) return undefined;
+    return mods.map(m => isProtein
+      ? { ptmType: _stripCcd(m.ptmType || m.modificationType || ''), ptmPosition: m.ptmPosition || m.basePosition }
+      : { modificationType: _stripCcd(m.modificationType || m.ptmType || ''), basePosition: m.basePosition || m.ptmPosition }
+    );
+  };
+
+  converted.sequences = [];
+  (job.sequences || []).forEach(seqObj => {
+    const type = Object.keys(seqObj)[0];
+    const data = seqObj[type];
+    const count = (Number.isInteger(data.count) && data.count > 0) ? data.count : 1;
+
+    if (type === 'proteinChain') {
+      if (data.useStructureTemplate) w.push('Protein: "useStructureTemplate: true" is not supported and was removed.');
+      if (data.glycans?.length)      w.push('Protein: glycans are not supported in AF3x and were removed.');
+      if (data.maxTemplateDate)      w.push(`Protein: "maxTemplateDate" (${data.maxTemplateDate}) is not supported and was removed.`);
+      if (count > 1 && (data.unpairedMsa || data.templates?.length)) {
+        w.push(`Protein (×${count}): MSA/templates applied to first chain only — add manually to others if needed.`);
+      }
+      const mods = convertMods(data.modifications, true);
+      for (let i = 0; i < count; i++) {
+        const entry = { protein: { id: nextId(), sequence: data.sequence || '' } };
+        if (mods) entry.protein.modifications = mods;
+        if (i === 0 && data.unpairedMsa) entry.protein.unpairedMsa = data.unpairedMsa;
+        if (i === 0 && data.pairedMsa)   entry.protein.pairedMsa   = data.pairedMsa;
+        if (i === 0 && data.templates?.length) entry.protein.templates = data.templates;
+        converted.sequences.push(entry);
+      }
+    } else if (type === 'rnaSequence') {
+      const mods = convertMods(data.modifications, false);
+      for (let i = 0; i < count; i++) {
+        const entry = { rna: { id: nextId(), sequence: data.sequence || '' } };
+        if (mods) entry.rna.modifications = mods;
+        converted.sequences.push(entry);
+      }
+    } else if (type === 'dnaSequence') {
+      const mods = convertMods(data.modifications, false);
+      for (let i = 0; i < count; i++) {
+        const entry = { dna: { id: nextId(), sequence: data.sequence || '' } };
+        if (mods) entry.dna.modifications = mods;
+        converted.sequences.push(entry);
+      }
+    } else if (type === 'ligand') {
+      const ccd = _stripCcd(data.ligand || '');
+      for (let i = 0; i < count; i++) {
+        converted.sequences.push({ ligand: { id: nextId(), ccdCodes: [ccd] } });
+      }
+    } else if (type === 'ion') {
+      w.push(`Ion "${data.ion || type}"${count > 1 ? ` ×${count}` : ''} removed — ions are not supported in AF3x.`);
+    } else {
+      w.push(`Unknown entity type "${type}" was removed.`);
+    }
+  });
+
+  return { converted, warnings: w };
+}
+
+function _openServerImportModal(result) {
+  const modal   = document.getElementById('server-import-modal');
+  const notes   = document.getElementById('serverImportNotes');
+  const options = document.getElementById('serverImportOptions');
+  const msaRow  = document.getElementById('serverImportMsaRow');
+  const tplRow  = document.getElementById('serverImportTplRow');
+  if (!modal) return;
+
+  // Render notes
+  notes.innerHTML = result.warnings.map((w, i) =>
+    `<span class="${i === 0 ? 'note-converted' : 'note-warn'}">${i === 0 ? 'ℹ' : '⚠'} ${w}</span>`
+  ).join('');
+
+  // Check which optional content exists in converted sequences
+  const hasMsa = result.converted.sequences.some(s => {
+    const d = Object.values(s)[0];
+    return d.unpairedMsa || d.pairedMsa;
+  });
+  const hasTpl = result.converted.sequences.some(s => {
+    const d = Object.values(s)[0];
+    return d.templates?.length > 0;
+  });
+
+  options.style.display = (hasMsa || hasTpl) ? '' : 'none';
+  msaRow.style.display  = hasMsa ? '' : 'none';
+  tplRow.style.display  = hasTpl ? '' : 'none';
+  document.getElementById('serverImportMsa').checked = true;
+  document.getElementById('serverImportTpl').checked = true;
+
+  modal._pendingResult = result;
+  modal.style.display  = 'flex';
+}
+
+function _initServerImportModal() {
+  const modal = document.getElementById('server-import-modal');
+  if (!modal) return;
+  const close = () => { modal.style.display = 'none'; modal._pendingResult = null; };
+  document.getElementById('serverImportClose')?.addEventListener('click', close);
+  document.getElementById('serverImportCancel')?.addEventListener('click', close);
+  modal.addEventListener('click', e => { if (e.target === modal) close(); });
+
+  document.getElementById('serverImportConfirm')?.addEventListener('click', () => {
+    const result = modal._pendingResult;
+    if (!result) return;
+    close();
+
+    const includeMsa = document.getElementById('serverImportMsa').checked;
+    const includeTpl = document.getElementById('serverImportTpl').checked;
+
+    // Deep-clone and strip unwanted fields
+    const json = JSON.parse(JSON.stringify(result.converted));
+    if (!includeMsa || !includeTpl) {
+      json.sequences.forEach(s => {
+        const d = Object.values(s)[0];
+        if (!includeMsa) { delete d.unpairedMsa; delete d.pairedMsa; }
+        if (!includeTpl && d.templates?.length > 0) delete d.templates;
+      });
+    }
+
+    const populateWarnings = _populateFromJSON(json);
+    const allWarnings = populateWarnings.filter(Boolean);
+    if (allWarnings.length) {
+      alert('Imported.\n\nNotes:\n• ' + allWarnings.join('\n• '));
+    }
+  });
+}
+
 function _handleJsonImport(e) {
   const file = e.target.files[0];
   if (!file) return;
   const reader = new FileReader();
   reader.onload = ev => {
     try {
-      const json = JSON.parse(ev.target.result);
-      _populateFromJSON(json);
+      const raw = JSON.parse(ev.target.result);
+      const dialect = _detectJsonDialect(raw);
+
+      if (dialect === 'alphafoldserver') {
+        const result = _convertServerJson(raw);
+        _openServerImportModal(result);
+      } else if (dialect === 'af3x') {
+        const populateWarnings = _populateFromJSON(raw);
+        if (populateWarnings.length) {
+          alert('JSON imported.\n\nNotes:\n• ' + populateWarnings.join('\n• '));
+        } else {
+          alert('JSON imported successfully!');
+        }
+      } else {
+        alert('Unrecognized JSON format. Expected an AF3/AF3x input JSON or an AlphaFold Server job_request.json.');
+      }
     } catch (err) {
       alert('Invalid JSON: ' + err.message);
     }
@@ -2342,8 +2754,28 @@ function _populateFromJSON(json) {
 
   // Job settings
   document.getElementById('jobName').value      = json.name || '';
-  document.getElementById('modelSeeds').value   = (json.modelSeeds || [1]).join(',');
-  // Version is fixed at 2 — ignore whatever the imported JSON declares.
+  const importedSeeds = json.modelSeeds || [1];
+  document.querySelectorAll('.seed-seg-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === 'specific');
+  });
+  document.getElementById('seedCount').style.display    = 'none';
+  document.getElementById('seedSpecific').style.display = '';
+  document.getElementById('seedSpecific').value         = importedSeeds.join(', ');
+
+  // Restore version from imported JSON
+  const importedVersion = parseInt(json.version, 10);
+  const versionEl = document.getElementById('inputVersion');
+  let versionWarning = null;
+  if (versionEl) {
+    if (importedVersion >= 1 && importedVersion <= 4) {
+      versionEl.value = importedVersion;
+    } else if (json.version !== undefined) {
+      versionEl.value = 4;
+      versionWarning = `Unsupported JSON version "${json.version}" — defaulted to version 4.`;
+    } else {
+      versionEl.value = 4;
+    }
+  }
 
   // Sequences
   (json.sequences || []).forEach(seqObj => {
@@ -2435,6 +2867,18 @@ function _populateFromJSON(json) {
         noTplCheck.checked = true;
         noTplCheck.dispatchEvent(new Event('change'));
       }
+    } else if (Array.isArray(data.templates) && data.templates.length > 0) {
+      data.templates.forEach(tpl => {
+        _addTemplate(card, card.dataset.id);
+        const entries = card.querySelectorAll('.tpl-entry');
+        const div = entries[entries.length - 1];
+        const mmcifTa   = div.querySelector('.tpl-mmcif');
+        const mmcifPath = div.querySelector('.tpl-mmcif-path');
+        if (tpl.mmcif && mmcifTa)         { mmcifTa.value   = tpl.mmcif;     if (mmcifPath) mmcifPath.disabled = true; }
+        else if (tpl.mmcifPath && mmcifPath) { mmcifPath.value = tpl.mmcifPath; if (mmcifTa)   mmcifTa.disabled   = true; }
+        if (tpl.queryIndices)    div.querySelector('.tpl-query-idx').value = tpl.queryIndices.join(', ');
+        if (tpl.templateIndices) div.querySelector('.tpl-tpl-idx').value   = tpl.templateIndices.join(', ');
+      });
     }
 
     _updateAdvancedSummary(card.dataset.id);
@@ -2483,7 +2927,7 @@ function _populateFromJSON(json) {
   _syncUserCcdExclusivity();
 
   updateViz();
-  alert('JSON imported successfully!');
+  return versionWarning ? [versionWarning] : [];
 }
 
 // ─── JSON Generation ──────────────────────────────────────────────────────────
@@ -2590,13 +3034,16 @@ function _validateGeneratedJSON(jsonObj) {
   const errors   = [];
   const warnings = [];
 
-  // Build chain → sequence map from the JSON object itself
-  const chainSeqMap = {};
+  // Build chain → sequence map and chain → type map from the JSON object itself
+  const chainSeqMap  = {};
+  const chainTypeMap = {};   // id → 'protein' | 'rna' | 'dna' | 'ccd_ligand' | 'smiles_ligand'
   (jsonObj.sequences || []).forEach(entry => {
     const type = Object.keys(entry)[0];
     const data = entry[type];
     const ids  = Array.isArray(data.id) ? data.id : [data.id];
     if (data.sequence) ids.forEach(id => { chainSeqMap[id] = data.sequence; });
+    const kind = (type === 'ligand') ? (data.smiles ? 'smiles_ligand' : 'ccd_ligand') : type;
+    ids.forEach(id => { chainTypeMap[id] = kind; });
   });
   const knownChains = new Set(Object.keys(chainSeqMap));
 
@@ -2633,7 +3080,7 @@ function _validateGeneratedJSON(jsonObj) {
 
         const _fmtAllowed = r => {
           const aas = r.filter(x => x !== 'N-term').join(', ');
-          return r.includes('N-term') ? `${aas} (or N-term at pos 1)` : aas;
+          return r.includes('N-term') ? `${aas} (or N-term)` : aas;
         };
         if (!chemOk(seq1, p1, r1)) {
           const aa = seq1[p1 - 1];
@@ -2680,6 +3127,23 @@ function _validateGeneratedJSON(jsonObj) {
     });
   });
 
+  // Bonded atom pairs — must have at least one CCD-ligand endpoint
+  const POLYMER_TYPES = new Set(['protein', 'rna', 'dna']);
+  (jsonObj.bondedAtomPairs || []).forEach((bond, bi) => {
+    const eA    = bond[0][0];
+    const eB    = bond[1][0];
+    const typeA = chainTypeMap[eA];
+    const typeB = chainTypeMap[eB];
+    const idx   = bi + 1;
+
+    if (typeA === 'smiles_ligand')
+      errors.push(`Bonded atom pair ${idx}: chain "${eA}" is a SMILES ligand — SMILES compounds have no named atoms; use a CCD ligand instead`);
+    if (typeB === 'smiles_ligand')
+      errors.push(`Bonded atom pair ${idx}: chain "${eB}" is a SMILES ligand — SMILES compounds have no named atoms; use a CCD ligand instead`);
+    if (typeA && typeB && POLYMER_TYPES.has(typeA) && POLYMER_TYPES.has(typeB))
+      errors.push(`Bonded atom pair ${idx}: both "${eA}" (${typeA}) and "${eB}" (${typeB}) are polymer chains — at least one endpoint must be a CCD ligand`);
+  });
+
   return { errors, warnings };
 }
 
@@ -2701,18 +3165,17 @@ function _showValidationReport(errors, warnings, infos = []) {
 
 function _buildJSON() {
   const name    = document.getElementById('jobName').value.trim();
-  const seedRaw = document.getElementById('modelSeeds').value.trim();
   const version = parseInt(document.getElementById('inputVersion')?.value || '4', 10) || 4;
 
+  const seedMode = document.querySelector('.seed-seg-btn.active')?.dataset.mode || 'count';
   let seeds;
-  if (/^\d+$/.test(seedRaw)) {
-    // Single integer N → generate seeds 1…N
-    const n = parseInt(seedRaw);
+  if (seedMode === 'count') {
+    const n = parseInt(document.getElementById('seedCount')?.value || '1');
     if (n < 1 || n > 100) throw new Error('Seed count must be between 1 and 100.');
     seeds = Array.from({ length: n }, (_, i) => i + 1);
   } else {
-    // Comma-separated list → use exact values
-    seeds = seedRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    const raw = document.getElementById('seedSpecific')?.value.trim() || '';
+    seeds = raw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
     if (!seeds.length) throw new Error('At least one model seed is required.');
   }
   if (!name) throw new Error('Job name is required.');
@@ -3438,7 +3901,7 @@ function _checkXlPositions() {
 
         const fmtR = r => {
           const aas = r.filter(x => x !== 'N-term').join('/');
-          return r.includes('N-term') ? `${aas}/N-term@1` : aas;
+          return r.includes('N-term') ? `${aas}/N-term` : aas;
         };
         if (xl.symmetric) {
           const r = xl.reactiveResidues;
@@ -3479,7 +3942,7 @@ function _checkXlPositions() {
         }
       }
 
-      chemWarn.textContent = chemMsg ? (isInfo ? chemMsg : `⚗ ${chemMsg}`) : '';
+      chemWarn.textContent = chemMsg ? (isInfo ? `ℹ ${chemMsg}` : `⚠ ${chemMsg}`) : '';
       chemWarn.style.display = chemMsg ? 'inline' : 'none';
       chemWarn.classList.toggle('is-info', isInfo);
     }
@@ -3505,7 +3968,12 @@ export function resetAll() {
 
   // Header fields
   document.getElementById('jobName').value    = '';
-  document.getElementById('modelSeeds').value = '1';
+  document.querySelectorAll('.seed-seg-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === 'count');
+  });
+  document.getElementById('seedCount').style.display    = '';
+  document.getElementById('seedSpecific').style.display = 'none';
+  document.getElementById('seedCount').value            = '1';
 
   // JSON output + stale banner
   document.getElementById('jsonOutput').innerHTML =
@@ -3686,7 +4154,7 @@ function _initIntroBanner() {
 
   collapseBtn.addEventListener('click', () => {
     const collapsed = body.style.display === 'none';
-    body.style.display = collapsed ? '' : 'none';
+    body.style.display      = collapsed ? '' : 'none';
     collapseBtn.textContent = collapsed ? 'Hide details ▾' : 'Show details ▸';
   });
 }
