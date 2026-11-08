@@ -2,7 +2,7 @@
 
 A browser-based JSON input generator for [AF3x](https://github.com/KosinskiLab/af3x) — the AlphaFold 3 extension for explicit crosslink modelling.
 
-**Live at https://lucxegg.github.io/af3x-input-generator/** — no installation needed, just open the link.
+**Live at https://kosinskilab.github.io/af3x-input-generator/** — no installation needed, just open the link.
 
 ## Features
 
@@ -13,9 +13,9 @@ A browser-based JSON input generator for [AF3x](https://github.com/KosinskiLab/a
 - Homomer support via comma-separated chain IDs (e.g. `A,B,C`)
 
 ### Crosslinks
-- All **16 official AF3x crosslinkers** in a grouped dropdown:
-  - Symmetric NHS-ester: DSSO, DSS, BS3, DSG, BS2G, DSBU, CDI, PHOX, BSPEG5, BSPEG9
-  - Asymmetric (order matters!): SDA, SDA25A, LCSDA, SDAD, azide-A-DSBSO
+- All **AF3x crosslinkers** in a grouped dropdown:
+  - Symmetric NHS-ester: DSSO, DSS, BS3, DSG, BS2G, DSBU, CDI, PHOX, BSPEG5, BSPEG9, azide-A-DSBSO
+  - Asymmetric (order matters!): SDA, SDA25A, LCSDA, SDAD
   - Dynamic: LINK\<n\> (flexible carbon chain), RIGID\<n\> (rigid aromatic rings)
 - **Warning banner** for asymmetric crosslinkers explaining residue order requirement
 - **CSV import**: upload xiVIEW or xiNET crosslink CSVs → auto-detect format → choose which pairs to import → assign proteins to chain IDs
@@ -120,3 +120,13 @@ against `folding_input.py`/`pipeline.py`/`templates.py` in the AF3x source):
   `pdbx_seq_one_letter_code` string, and single-row categories written in flat
   key-value form instead of a `loop_` block (common for `_entity`/`_entity_poly` in
   single-chain/single-entity depositions).
+
+## Data sources
+
+Sequences fetched by UniProt ID are retrieved from [UniProt](https://www.uniprot.org) (The UniProt Consortium),
+available under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+## Credits
+
+Developed by Luca Leon Egger in the [Kosinski Lab](https://www.embl.org/groups/kosinski/), EMBL Hamburg.
+Maintained by the Kosinski Lab. © 2026 European Molecular Biology Laboratory (EMBL).

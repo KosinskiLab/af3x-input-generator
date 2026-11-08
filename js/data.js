@@ -157,7 +157,7 @@ export const CROSSLINKERS = [
     category: 'NHS-ester + diazirine (asymmetric)',
     reactiveResidues: [['K', 'S', 'T', 'Y', 'N-term'], ['any AA']],
     spacer: '~25 Å',
-    description: 'SDA with 25 Å spacer arm — long-range variant (experimental AF3x branch)',
+    description: 'SDA with 25 Å spacer arm — long-range variant',
     asymmetricNote: 'Residue 1: NHS-ester (K, S, T, Y, N-term) · Residue 2: diazirine (any AA)',
   },
   {
@@ -180,12 +180,11 @@ export const CROSSLINKERS = [
   },
   {
     name: 'azide-A-DSBSO',
-    symmetric: false,
-    category: 'NHS-ester + diazirine (asymmetric)',
-    reactiveResidues: [['K', 'S', 'T', 'Y', 'N-term'], ['any AA']],
+    symmetric: true,
+    category: 'NHS-ester (symmetric)',
+    reactiveResidues: ['K', 'S', 'T', 'Y', 'N-term'],
     spacer: '~15 Å',
     description: 'Azide-A-DSBSO — contains azide group for click chemistry',
-    asymmetricNote: 'Residue 1: NHS-ester (K, S, T, Y, N-term) · Residue 2: diazirine (any AA)',
   },
   // Dynamic linkers
   {

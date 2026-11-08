@@ -268,7 +268,9 @@
           Address by chain ID, 1-based residue number, and atom name.
         </p>
         <div id="bonds-container"></div>
-        <button class="btn btn-outline btn-sm" id="addBondBtn" style="margin-top:8px">+ Add bond</button>
+        <div class="section-actions">
+          <button class="btn btn-outline btn-sm" id="addBondBtn">+ Add bond</button>
+        </div>
       </details>
 
       <!-- Batch export / Screening -->
@@ -375,9 +377,8 @@
         <p>
           <strong>AF3x</strong> is a modified version of AlphaFold 3 developed at the
           <a href="https://www.embl.org/groups/kosinski/" target="_blank" rel="noopener">Kosinski Lab (EMBL)</a>
-          that accepts explicit <strong>crosslink restraints</strong> as input. Crosslinks are modelled as
-          small-molecule covalent bridges between two residues, giving the network of distance constraints
-          to guide structure prediction.
+          that models <strong>crosslinks explicitly</strong>: each crosslinker is added as a small-molecule
+          ligand, covalently bonded to both crosslinked residues, instead of a distance restraint.
         </p>
         <p>
           This tool generates the JSON input files required by AF3x. It handles sequences,
@@ -501,14 +502,44 @@
         <ul class="about-list">
           <li><strong>Residue numbering is 1-based</strong> — position 1 is the first residue in your input sequence, regardless of PDB numbering.</li>
           <li><strong>Chain IDs</strong> — use the chain ID assigned in the Sequences panel (e.g. A, B). One chain card can represent multiple copies (homodimers) by entering comma-separated IDs: <code>A,B</code>.</li>
-          <li><strong>Asymmetric crosslinkers</strong> — residue 1 is the NHS-ester end (reacts with K/S/T/Y/N-term), residue 2 is the diazirine end (any AA). The order matters for how AF3x places the linker.</li>
+          <li><strong>Asymmetric crosslinkers</strong> — residue 1 is the NHS-ester end (reacts with K/S/T/Y/N-term), residue 2 is the diazirine end (any AA). AF3x requires this order; this tool corrects it automatically on export when only one order is chemically possible.</li>
           <li><strong>SASD vs Euclidean distance</strong> — the max-distance threshold in each crosslinker preset is a solvent-accessible surface distance (SASD). The Euclidean CB–CB distance is always shorter; a pair passing the Euclidean check may still fail SASD if the path goes around an interface.</li>
-          <li><strong>Seeds</strong> — AF3x uses model seeds to generate diverse structural models. A single seed produces one model; using 5 seeds gives an ensemble for picking the best-ranked prediction.</li>
+          <li><strong>Seeds</strong> — each model seed gives 5 structural models (diffusion samples), and AF3x ranks all of them. Preferably use 20 seeds (100 models); compute time grows with the number of seeds.</li>
           <li><strong>Version field</strong> — the AF3x input format version, default 4 (current schema). Use 3 for older AF3x installations that don't support v4 fields.</li>
           <li><strong>Description field</strong> — a free-text comment per chain (under <em>Advanced options</em>). Purely cosmetic, not used by AF3x for prediction — leave blank unless you want a label in the JSON.</li>
           <li><strong>User CCD</strong> — for custom ligand definitions not in the standard CCD. Provide inline mmCIF content <em>or</em> a file path, not both.</li>
           <li><strong>Did the template actually get used?</strong> AF3x accepting a template (skipping its own search) doesn't guarantee the predicted structure closely matches it — templates are a soft signal, not a hard constraint. To check: (1) look for "Skipping MSA and template search… because it already has templates" in the AF3x log, and (2) for a stronger check, run the same job again with <em>Without templates</em> and compare pLDDT/confidence between the two runs, or structurally align the predicted model against the template mmCIF.</li>
         </ul>
+      </section>
+
+      <!-- Credits -->
+      <section class="about-section">
+        <h2>Credits</h2>
+        <p>
+          Developed by Luca Leon Egger in the
+          <a href="https://www.embl.org/groups/kosinski/" target="_blank" rel="noopener">Kosinski Lab</a>,
+          EMBL Hamburg. Maintained by the Kosinski Lab.
+          © 2026 European Molecular Biology Laboratory (EMBL).
+        </p>
+        <p>
+          Sequences are retrieved from
+          <a href="https://www.uniprot.org" target="_blank" rel="noopener">UniProt</a>
+          (The UniProt Consortium), available under
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
+        </p>
+      </section>
+
+      <!-- Privacy -->
+      <section class="about-section">
+        <h2>Privacy</h2>
+        <p>
+          The generator runs entirely in your browser; your sequences and inputs are not uploaded anywhere.
+          Your current input is autosaved in your browser's local storage; <em>Reset</em> clears it.
+          Fetching by UniProt ID sends that ID to UniProt. The page loads its font from Google Fonts, and
+          the ZIP export loads the JSZip library from jsDelivr; both see your IP address. The site is hosted
+          on GitHub Pages, which logs visitors' IP addresses
+          (<a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">GitHub privacy statement</a>).
+        </p>
       </section>
 
     </div>
@@ -698,6 +729,12 @@
           <button class="btn btn-primary btn-sm" id="uniprotModalFetchBtn">Fetch</button>
         </div>
         <div id="uniprotModalStatus" class="uniprot-status"></div>
+        <p class="uniprot-credit">
+          Sequences are retrieved from
+          <a href="https://www.uniprot.org" target="_blank" rel="noopener">UniProt</a>
+          (The UniProt Consortium), available under
+          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
+        </p>
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" id="uniprotModalCancel">Cancel</button>

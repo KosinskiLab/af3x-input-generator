@@ -3829,10 +3829,12 @@ function _checkDuplicateChainIds() {
 
 function _checkXlPositions() {
   // Build chain → sequence maps
-  const chainLen = {};
-  const chainSeq = {};
+  const chainLen  = {};
+  const chainSeq  = {};
+  const allChains = new Set();   // every defined chain ID, with or without a sequence yet
   document.querySelectorAll('.seq-card').forEach(card => {
     const chainRaw = card.querySelector('.seq-chain-id')?.value.trim() || '';
+    chainRaw.split(',').map(s => s.trim()).filter(Boolean).forEach(id => allChains.add(id));
     const seq      = card.querySelector('.seq-textarea')?.value.replace(/\s/g, '').toUpperCase() || '';
     if (!seq) return;
     chainRaw.split(',').map(s => s.trim()).filter(Boolean).forEach(id => {
@@ -3860,9 +3862,12 @@ function _checkXlPositions() {
     const c2 = row.querySelector('.xl-chain-b')?.value.trim();
     const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || 0;
 
-    // Position bounds
+    // Undefined chain IDs, then position bounds
     let posMsg = '';
-    if (c1 && p1 && chainLen[c1] && p1 > chainLen[c1]) {
+    const missing = [...new Set([c1, c2].filter(c => c && !allChains.has(c)))];
+    if (missing.length) {
+      posMsg = `chain${missing.length > 1 ? 's' : ''} ${missing.join(', ')} not defined in sequences`;
+    } else if (c1 && p1 && chainLen[c1] && p1 > chainLen[c1]) {
       posMsg = `${c1}: pos ${p1} > len ${chainLen[c1]}`;
     } else if (c2 && p2 && chainLen[c2] && p2 > chainLen[c2]) {
       posMsg = `${c2}: pos ${p2} > len ${chainLen[c2]}`;

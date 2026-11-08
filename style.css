@@ -869,6 +869,9 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .uniprot-row { display: flex; gap: 8px; }
 .uniprot-input { flex: 1; font-family: var(--font-mono); }
 .uniprot-status { font-size: 12px; margin-top: 4px; }
+.uniprot-credit { font-size: 12px; color: var(--text-2); line-height: 1.5; margin: 10px 0 0; }
+.uniprot-credit a { color: var(--primary); text-decoration: none; }
+.uniprot-credit a:hover { text-decoration: underline; }
 .uniprot-status.loading { color: var(--text-2); }
 .uniprot-status.ok      { color: var(--success); }
 .uniprot-status.error   { color: var(--danger); }
