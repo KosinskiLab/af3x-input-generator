@@ -13,8 +13,8 @@ import {
   esc, readFileText, plural, cleanSeq, ALPHABET, parseFasta, shortHeader, guessSeqType, parseUniprotIds, fetchUniprot,
   sniffFile, validateA3m, needlemanWunsch, alignmentToMapping, parseIntList, formatRanges, parseRanges,
 } from './util.js';
-import { findXl, checkPair, validate, toJson, detectJsonDialect, convertServerJson } from './af_json.js';
-import { toast, openMenu, openPopover, closePopover, showModal, hideModal, initModals, anyModalOpen } from './ui.js';
+import { findXl, checkPair, validate, toJson, detectJsonDialect, convertServerJson, sanitisedName } from './af_json.js';
+import { toast, openMenu, openPopover, closePopover, showModal, hideModal, initModals, anyModalOpen, initDropdowns, syncDropdowns } from './ui.js';
 
 const $ = id => document.getElementById(id);
 
@@ -41,6 +41,7 @@ const ICON = {
   edit: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.5 2.5l2 2L5 13l-2.7.7L3 11z"/></svg>',
   more: '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/></svg>',
   grip: '<svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden="true"><circle cx="2.5" cy="2.5" r="1.2"/><circle cx="7.5" cy="2.5" r="1.2"/><circle cx="2.5" cy="7" r="1.2"/><circle cx="7.5" cy="7" r="1.2"/><circle cx="2.5" cy="11.5" r="1.2"/><circle cx="7.5" cy="11.5" r="1.2"/></svg>',
+  x: '<svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><path d="M1 1l6 6M7 1 1 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
 };
 
 // ─── Refresh loop ────────────────────────────────────────────────────────────
@@ -66,6 +67,7 @@ function refresh() {
   renderSeqViews(model);
   drawDiagram(model);
   syncSections(model);
+  syncDropdowns();
   scheduleSave();
 }
 
@@ -233,7 +235,7 @@ function showSeqView(card) {
 
 function autoGrow(ta) {
   ta.style.height = 'auto';
-  ta.style.height = `${Math.min(ta.scrollHeight + 2, 240)}px`;
+  ta.style.height = `${Math.min(ta.scrollHeight + 2, 17 * parseFloat(getComputedStyle(document.documentElement).fontSize))}px`;
 }
 
 function editSeq(card, pos = null) {
@@ -525,7 +527,7 @@ function addMod(card, ccd, pos) {
   chip.className = 'chip mod-chip';
   chip.dataset.ccd = ccd;
   chip.dataset.pos = pos;
-  chip.innerHTML = `<b>${esc(ccd)}</b><span class="chip-at"></span><button class="chip-x" aria-label="Remove ${esc(ccd)}">×</button>`;
+  chip.innerHTML = `<b>${esc(ccd)}</b><span class="chip-at"></span><button class="chip-x" aria-label="Remove ${esc(ccd)}" title="Remove">${ICON.x}</button>`;
   card.querySelector('.opt-mods .chips').appendChild(chip);
   card.querySelector('.opt-mods').hidden = false;
   touch();
@@ -762,13 +764,15 @@ const chainSel = (cls, value, only = '') =>
 
 /** Rebuild the options of every chain <select>, keeping the chosen chain. */
 function refreshChainSels(root = document) {
-  const chains = chainCards().map(c => ({ id: cardId(c), type: c.dataset.type }));
+  const chains = chainCards().map(c => ({ id: cardId(c), type: c.dataset.type, label: c.querySelector('.chain-label').value.trim() }));
   root.querySelectorAll('select.chain-sel').forEach(sel => {
     const only = sel.dataset.only;
-    const ids = [...new Set(chains.filter(c => c.id && (!only || c.type === only)).map(c => c.id))];
+    const ok = chains.filter(c => c.id && (!only || c.type === only));
+    const ids = [...new Set(ok.map(c => c.id))];
+    const hint = new Map(ok.map(c => [c.id, c.label]));
     let v = sel.dataset.v || '';
     if (!v) v = ids[0] || '';
-    let html = ids.map(id => `<option>${esc(id)}</option>`).join('');
+    let html = ids.map(id => `<option data-hint="${esc(hint.get(id) || '')}">${esc(id)}</option>`).join('');
     if (v && !ids.includes(v)) html += `<option class="missing">${esc(v)}</option>`;
     if (!html) html = '<option value="">–</option>';
     sel.innerHTML = html;
@@ -1197,7 +1201,7 @@ function download(filename, text, type = 'application/json') {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-const safeName = name => name.replace(/[^\w.+-]+/g, '_') || 'af3x_job';
+const safeName = name => sanitisedName(name) || 'af3x_job';
 
 async function copyJson() {
   try {
@@ -1609,6 +1613,12 @@ async function runBatch() {
 
 // ─── Advanced options menu ───────────────────────────────────────────────────
 
+function showCcdSec() {
+  $('ccdSec').hidden = false;
+  touch();
+  reveal($('ccdSec'));
+}
+
 /** Run fn(card) on the one matching chain, or ask which. */
 function withChain(anchor, filter, title, fn) {
   const cards = chainCards().filter(filter);
@@ -1632,7 +1642,7 @@ function openPalette() {
     { label: 'Disulfide bond', hint: 'Cys–Cys', keys: 'ss s-s cysteine bridge disulphide', onClick: () => reveal(addSs()) },
     { label: 'Modification', hint: 'PTM or modified base', keys: 'ptm phospho methyl acetyl ccd', onClick: () => withChain(a, polymer, 'Modify which chain?', startMod) },
     { label: 'Bonded atom pair', hint: 'Covalent ligand, glycan', keys: 'bond covalent bondedAtomPairs', onClick: () => reveal(addBond()) },
-    { label: 'Custom ligand definition', hint: 'Your own CCD mmCIF', keys: 'userCCD userCCDPath ligand cif', onClick: () => { $('ccdSec').hidden = false; touch(); reveal($('ccdSec')); } },
+    { label: 'Custom ligand definition', hint: 'Your own CCD mmCIF', keys: 'userCCD userCCDPath ligand cif', onClick: showCcdSec },
     { heading: 'MSA and templates' },
     { label: 'Run without MSA', hint: 'Per chain', keys: 'msa none single sequence unpairedMsa', onClick: () => withChain(a, msaOk, 'No MSA for which chain?', mode('msa', 'none')) },
     { label: 'Custom MSA', hint: 'Your own A3M', keys: 'msa a3m alignment unpairedMsa pairedMsa', onClick: () => withChain(a, msaOk, 'Custom MSA for which chain?', mode('msa', 'custom')) },
@@ -1663,7 +1673,7 @@ function openJobMenu() {
       <div class="seg" id="seedSeg"><button data-v="count" title="Seeds 1, 2, … N">1…N</button><button data-v="list" title="Type the seed values">Exact</button></div>
     </div>
     <div class="form-row"><span>JSON version</span>
-      <select id="versionSel" title="Use a lower version only for an old AlphaFold 3 installation">${[4, 3, 2, 1].map(v => `<option${v === version ? ' selected' : ''}>${v}</option>`).join('')}</select>
+      <div class="seg" id="versionSeg" title="Use a lower version only for an old AlphaFold 3 installation">${[4, 3, 2, 1].map(v => `<button data-v="${v}">${v}</button>`).join('')}</div>
     </div>`;
   const seg = box.querySelector('#seedSeg');
   const paint = () => seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === seedMode));
@@ -1675,7 +1685,16 @@ function openJobMenu() {
     paint();
     touch();
   });
-  box.querySelector('#versionSel').addEventListener('change', e => { version = parseInt(e.target.value, 10); touch(); });
+  const vseg = box.querySelector('#versionSeg');
+  const paintV = () => vseg.querySelectorAll('button').forEach(b => b.classList.toggle('on', +b.dataset.v === version));
+  paintV();
+  vseg.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    version = parseInt(b.dataset.v, 10);
+    paintV();
+    touch();
+  });
   openPopover($('jobMoreBtn'), box, { align: 'right' });
 }
 
@@ -1890,6 +1909,11 @@ function initRows() {
   });
 
   $('addXlBtn').addEventListener('click', () => addXlGroup().querySelector('.p1').focus());
+  $('addMoreBtn').addEventListener('click', e => openMenu(e.currentTarget, [
+    { label: 'Disulfide bond', hint: 'Cys–Cys', onClick: () => reveal(addSs()) },
+    { label: 'Bonded atom pair', hint: 'Covalent ligand, glycan', onClick: () => reveal(addBond()) },
+    { label: 'Custom ligand definition', hint: 'Your own CCD mmCIF', onClick: showCcdSec },
+  ]));
   $('addSsBtn').addEventListener('click', () => addSs().querySelector('.p1').focus());
   $('addBondBtn').addEventListener('click', () => addBond().querySelector('.ra').focus());
 
@@ -1953,6 +1977,7 @@ function initDrop() {
 
 function init() {
   initModals();
+  initDropdowns();
   initImportModal();
   initPdbModal();
   try { initInteractiveTopology(); } catch (e) { console.warn('diagram init', e); }

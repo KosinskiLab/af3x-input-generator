@@ -70,6 +70,13 @@ export function checkPair(pair, xlName, chainById) {
   return { state: 'error', msg: `one end must be ${fmt(end1)}` };
 }
 
+/** The job name as AlphaFold 3 uses it for the output folder and files (Input.sanitised_name). */
+export const sanitisedName = name => String(name || '').replace(/ /g, '_').replace(/[^A-Za-z0-9_.-]/g, '');
+
+// Output files are named <name>_seed-<seed>_sample-<i>_summary_confidences.json (up to 50 more
+// characters); file names may have 255. The rest is left for batch-export suffixes.
+const MAX_NAME = 160;
+
 /**
  * Model → [{ level: 'todo'|'error'|'warn', msg, el }].
  * 'todo': a required field is still empty. 'todo' and 'error' block the export.
@@ -80,8 +87,12 @@ export function validate(model) {
   const warn = (msg, el) => issues.push({ level: 'warn', msg, el });
   const todo = (msg, el) => issues.push({ level: 'todo', msg, el });
 
+  const outName = sanitisedName(model.name);
   if (!model.name) todo('Name the job', model.nameEl);
-  else if (!/[A-Za-z0-9._-]/.test(model.name)) err('Job name needs a letter or a number', model.nameEl);
+  else if (!outName) err('Job name needs a letter or a number', model.nameEl);
+  else if (/^\.+$/.test(outName)) err('Job name needs a letter or a number', model.nameEl);
+  else if (outName.length > MAX_NAME) err(`Job name: at most ${MAX_NAME} characters`, model.nameEl);
+  else if (outName !== model.name) warn(`Output folder will be ${outName}`, model.nameEl);
   if (model.seedMode === 'count') {
     if (!(model.seedCount >= 1 && model.seedCount <= 1000)) err('Seeds: enter a number from 1 to 1000', model.seedEl);
   } else if (!model.seedList.length) {
@@ -110,12 +121,18 @@ export function validate(model) {
       err(`${tag}: ${odd.slice(0, 8).join(' ')} ${odd.length === 1 ? 'is' : 'are'} not ${what}`, c.el);
     }
 
+    const modAt = new Map();
     for (const m of c.mods) {
       if (!m.ccd || !m.pos) continue;
       if (m.pos > c.seq.length) { err(`${tag}: ${m.ccd} at ${m.pos} is past the end`, m.el); continue; }
+      if (modAt.has(m.pos)) { err(`${tag}: two modifications at ${m.pos}`, m.el); continue; }
+      modAt.set(m.pos, m);
       const ptm = PTM_DATABASE.find(p => p.ccd === m.ccd);
-      if (ptm && c.seq[m.pos - 1] !== ptm.targetAA) {
-        warn(`${tag}: ${m.ccd} expects ${ptm.targetAA}, position ${m.pos} is ${c.seq[m.pos - 1]}`, m.el);
+      const kind = { 'RNA modification': 'rna', 'DNA modification': 'dna' }[ptm?.category] || 'protein';
+      if (ptm && kind !== c.type) {
+        err(`${tag}: ${m.ccd} is ${{ protein: 'a protein', rna: 'an RNA', dna: 'a DNA' }[kind]} modification`, m.el);
+      } else if (ptm && c.seq[m.pos - 1] !== ptm.targetAA) {
+        err(`${tag}: ${m.ccd} modifies ${ptm.targetAA}, not ${c.seq[m.pos - 1]}${m.pos}`, m.el);
       }
     }
 

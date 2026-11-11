@@ -72,6 +72,7 @@
         <div id="xlGroups"></div>
         <div class="add-row">
           <button class="btn add" id="addXlBtn">+ Crosslinker</button>
+          <button class="btn add" id="addMoreBtn" aria-haspopup="menu" title="Disulfide bond, bonded atom pair, custom ligand">+ More <svg width="8" height="5" viewBox="0 0 8 5" aria-hidden="true"><path d="M.75.75 4 4 7.25.75" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           <button class="btn ghost" id="xlCsvBtn" title="xiVIEW or xiNET CSV">Import CSV</button>
           <span class="add-hint" id="xlHint">or click two residues in a sequence</span>
         </div>
@@ -148,7 +149,7 @@
         </div>
 
         <details class="json-details" id="jsonDetails">
-          <summary>JSON</summary>
+          <summary title="Long content (MSAs, template structures) is shortened here. Use Download or Copy for the full file.">JSON preview</summary>
           <pre id="jsonOut" class="json-out"></pre>
         </details>
 
@@ -175,12 +176,12 @@
         <ol>
           <li>Paste a sequence, FASTA or UniProt ID into a chain, or drop a FASTA / PDB / mmCIF file on the page.</li>
           <li>Click two residues to crosslink them, type the pairs, or import an xiVIEW / xiNET CSV.</li>
-          <li>Name the job and download the JSON. Run it with <code>run_alphafold.py --json_path=job.json</code>.</li>
+          <li>Name the job and download the JSON. Run it with <code class="nw">run_alphafold.py --json_path=job.json</code>.</li>
         </ol>
         <p>
-          Everything else (disulfides, modifications, MSA, templates, bonded atoms, custom ligands, batch
-          export) is under <b>Advanced options</b> (press <kbd>/</kbd>), in each chain's <b>⋯</b> menu, or in
-          the menu that opens when you click a residue.
+          Disulfides, bonded atoms and custom ligands are under <b>+ More</b>; modifications, MSA and templates
+          in each chain's <b>⋯</b> menu or the bar that opens when you click a residue. <b>Advanced options</b>
+          (press <kbd>/</kbd>) searches all of them, plus batch export.
         </p>
 
         <h4>Crosslinkers</h4>
@@ -205,7 +206,7 @@
           <li>To edit a sequence, click beside its letters or double-click it. Once a chain has crosslinks,
             modifications or other settings, use the pencil button, so they are not shifted by accident.</li>
           <li>AF3x drops a crosslink whose residue is already used by an earlier one, unless it runs with
-            <code>--noremove_overlapping_crosslinks</code>.</li>
+            <code class="nw">--noremove_overlapping_crosslinks</code>.</li>
           <li>Each seed gives 5 models. More seeds sample more; run time grows with them.</li>
           <li>A disulfide is modelled as Cys→Ala plus an S–S linker.</li>
           <li>A chain with custom templates also needs its MSA set to None or Custom (an AlphaFold 3 rule).</li>

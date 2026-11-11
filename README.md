@@ -17,7 +17,7 @@ Everything else stays off the page until it is used:
 
 | Feature | Where |
 |---|---|
-| Disulfide bonds, bonded atom pairs, custom ligand definition (CCD) | **Advanced options** (press `/`) |
+| Disulfide bonds, bonded atom pairs, custom ligand definition (CCD) | **+ More** next to + Crosslinker, or **Advanced options** (press `/`) |
 | Modifications (PTMs, modified bases) | click a residue, or a chain's `⋯` menu |
 | MSA: none or your own A3M; templates: none or your own structure | a chain's `⋯` menu, or Advanced options |
 | Exact seed values, JSON version | the settings button next to Seeds |

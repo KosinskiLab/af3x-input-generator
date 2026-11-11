@@ -16,14 +16,16 @@ export function drawArcDiagram(svg, chains, xlGroups, ssBonds = []) {
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   if (!chains.length) { svg.setAttribute('height', 0); return; }
 
-  const width = svg.getBoundingClientRect().width || 360;
+  // drawn in design px; the viewBox scales it with the page (root font size / 14)
+  const k = parseFloat(getComputedStyle(document.documentElement).fontSize) / 14 || 1;
+  const width = (svg.getBoundingClientRect().width || 360) / k;
   const barMax = Math.max(40, width - LEFT - RIGHT);
   const rowOf = new Map(chains.map((c, i) => [c.id, i]));
   const firstId = chains[0].id;
   const allPairs = [...xlGroups.flatMap(g => g.pairs), ...ssBonds];
   const top = allPairs.some(p => p.chain1 === firstId && p.chain2 === firstId) ? INTRA_MAX + 12 : 12;
   const height = top + (chains.length - 1) * STRIDE + BAR_H + 12;
-  svg.setAttribute('height', height);
+  svg.setAttribute('height', height * k);
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
   const maxLen = Math.max(1, ...chains.map(c => c.length || 0));

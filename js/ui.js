@@ -57,6 +57,8 @@ export function popoverAnchor() {
  * a DOMRect-like object). Closes on outside click, Escape, resize.
  */
 export function openPopover(anchor, content, { align = 'left', cls = '', onClose = null } = {}) {
+  // a second press on the same button closes its popover
+  if (_open && anchor instanceof Element && _open.anchor === anchor) { closePopover(); return null; }
   closePopover();
   const el = document.createElement('div');
   el.className = `popover ${cls}`;
@@ -67,11 +69,18 @@ export function openPopover(anchor, content, { align = 'left', cls = '', onClose
   if (isEl) { anchor.classList.add('is-open'); anchor.setAttribute('aria-expanded', 'true'); }
 
   const r = isEl ? anchor.getBoundingClientRect() : anchor;
-  const w = el.offsetWidth, h = el.offsetHeight;
+  const w = el.offsetWidth;
+  let h = el.offsetHeight;
   let left = align === 'right' ? r.right - w : align === 'center' ? r.left + r.width / 2 - w / 2 : r.left;
   left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
-  let top = r.bottom + 6;
-  if (top + h > window.innerHeight - 8 && r.top - h - 6 > 8) top = r.top - h - 6;
+  // below the anchor if it fits, else on the side with more room, shrunk to fit
+  const below = window.innerHeight - r.bottom - 14, above = r.top - 14;
+  const up = h > below && above > below;
+  if (h > (up ? above : below)) {
+    content.style.maxHeight = `${Math.max(120, up ? above : below)}px`;
+    h = el.offsetHeight;
+  }
+  let top = up ? r.top - h - 6 : r.bottom + 6;
   el.style.left = `${left}px`;
   el.style.top = `${Math.max(8, top)}px`;
   return el;
@@ -180,10 +189,110 @@ export function openMenu(anchor, items, opts = {}) {
   if (input) input.addEventListener('input', () => render(input.value));
 
   render('');
-  openPopover(anchor, box, { align: opts.align || 'left', cls: `popover-menu ${opts.cls || ''}` });
+  setActive(shown.findIndex(b => b.classList.contains('checked')));
+  if (!openPopover(anchor, box, { align: opts.align || 'left', cls: `popover-menu ${opts.cls || ''}`, onClose: opts.onClose })) return null;
   if (input) input.focus();
   else { box.tabIndex = -1; box.focus(); }
   return box;
+}
+
+// ─── Dropdowns ───────────────────────────────────────────────────────────────
+// Every <select> stays in the page as the value holder (hidden) and is shown as
+// a button that opens the menu above. Options may carry data-hint.
+
+const _dd = new WeakMap();
+
+function syncDropdown(sel) {
+  let btn = _dd.get(sel);
+  if (!btn || !btn.isConnected) {
+    btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'dd';
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.innerHTML = '<span class="dd-label"></span><svg class="dd-caret" width="8" height="5" viewBox="0 0 8 5" aria-hidden="true"><path d="M.75.75 4 4 7.25.75" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    btn._sel = sel;
+    sel.after(btn);
+    sel.hidden = true;
+    sel.tabIndex = -1;
+    _dd.set(sel, btn);
+  }
+  const o = sel.selectedOptions[0];
+  const text = o ? o.textContent : '–';
+  const label = btn.firstChild;
+  if (label.textContent !== text) label.textContent = text;
+  btn.classList.toggle('missing', !!o?.classList.contains('missing'));
+  btn.disabled = sel.disabled;
+  for (const a of ['title', 'aria-label']) {
+    const v = sel.getAttribute(a);
+    if (v !== btn.getAttribute(a)) v == null ? btn.removeAttribute(a) : btn.setAttribute(a, v);
+  }
+}
+
+/** Create or update the button of every <select> under `root`. */
+export function syncDropdowns(root = document) {
+  root.querySelectorAll('select').forEach(syncDropdown);
+}
+
+function choose(sel, value) {
+  if (sel.value !== value) {
+    sel.value = value;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  syncDropdown(sel);
+}
+
+function openDropdown(btn) {
+  const sel = btn._sel;
+  const items = [];
+  let group = null;
+  for (const o of sel.options) {
+    const g = o.parentElement.tagName === 'OPTGROUP' ? o.parentElement.label : null;
+    if (g && g !== group) items.push({ heading: g });
+    group = g;
+    items.push({
+      label: o.textContent, hint: o.dataset.hint || '', checked: o.selected, disabled: o.disabled,
+      onClick: () => { choose(sel, o.value); btn.focus(); },
+    });
+  }
+  openMenu(btn, items, { search: sel.options.length > 12, cls: 'dd-menu', onClose: () => { if (!document.activeElement || document.activeElement === document.body) btn.focus(); } });
+}
+
+/** Turn selects into dropdown buttons now and whenever the page changes. */
+export function initDropdowns() {
+  syncDropdowns();
+  let queued = false;
+  new MutationObserver(() => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; syncDropdowns(); });
+  }).observe(document.body, { childList: true, subtree: true });
+  document.addEventListener('change', e => { if (e.target.tagName === 'SELECT') syncDropdown(e.target); });
+  document.addEventListener('click', e => {
+    const btn = e.target.closest?.('button.dd');
+    if (!btn) return;
+    openDropdown(btn);
+  });
+  document.addEventListener('keydown', e => {
+    const btn = e.target.closest?.('button.dd');
+    if (!btn || e.ctrlKey || e.metaKey) return;
+    const sel = btn._sel;
+    const opts = [...sel.options].filter(o => !o.disabled);
+    const at = opts.findIndex(o => o.selected);
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && !e.altKey) {
+      e.preventDefault();
+      const next = opts[Math.max(0, Math.min(opts.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)))];
+      if (next) choose(sel, next.value);
+    } else if (e.key === 'ArrowDown' && e.altKey) {
+      e.preventDefault();
+      openDropdown(btn);
+    } else if (e.key.length === 1 && /\S/.test(e.key) && !e.altKey) {
+      // type a letter to pick the next option that starts with it
+      const k = e.key.toLowerCase();
+      const order = [...opts.slice(at + 1), ...opts.slice(0, at + 1)];
+      const hit = order.find(o => o.textContent.trim().toLowerCase().startsWith(k));
+      if (hit) { e.preventDefault(); choose(sel, hit.value); }
+    }
+  });
 }
 
 // ─── Modals ──────────────────────────────────────────────────────────────────

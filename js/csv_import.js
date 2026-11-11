@@ -302,6 +302,8 @@ function _renderProteinMapping(proteins) {
       status.className = 'fetch-status';
       status.dataset.protein = prot;
       row.appendChild(status);
+    } else {
+      row.appendChild(Object.assign(document.createElement('span'), { className: 'fetch-status-pad' }));
     }
 
     container.appendChild(row);
