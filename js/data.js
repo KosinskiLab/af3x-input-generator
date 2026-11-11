@@ -1,51 +1,14 @@
-// Static data: crosslinkers, PTM database, chain colours
+// Static data: crosslinkers, PTM database, crosslink colours
 
-// ─── Chain colours, grouped by entity type ───────────────────────────────────
-// Each type gets its own colour family (matches the +Protein/+RNA/+DNA/+Ligand
-// button accents) so chains stay recognisable by type at a glance. Shades are
-// generated from a base hue per type rather than a small fixed palette, so any
-// number of same-type chains (large multimers included) stay distinguishable
-// instead of repeating after a handful of entries.
-const CHAIN_HUE_BY_TYPE = { protein: 217, rna: 142, dna: 28, ligand: 271 };
+// Colours of crosslinker groups, in fixed order, one step per theme.
+// Checked for colour-vision-deficiency separation on the page surfaces
+// (light #fdfdfc, dark #1a1a19); keep the order when editing.
+export const XL_GROUP_COLORS = {
+  light: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'],
+  dark:  ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
+};
 
-// Lightness is kept in a narrow, always-visible band (47-65%): dipping much
-// darker makes a bar nearly disappear against a dark page background and
-// makes the chain-ID text (which also uses this colour) unreadable — that
-// was the actual bug, not the hue spread. Differentiation instead comes
-// from large hue swings across most of the type's available arc, which is
-// far more perceptually distinct than a saturation or lightness tweak.
-// Same 12-step cycle for every type, so any of them stays distinguishable
-// even for a large multimer, not just protein.
-const _LIGHT_STEPS = [50, 62, 48, 65, 52, 58, 49, 64, 55, 47, 61, 53];
-const _HUE_STEPS   = [0, -55, 35, -25, 50, -40, 20, -15, 45, -30, 10, 60];
-const _SAT_RINGS   = [85, 65];
-
-/** Returns a CSS color string for the Nth (0-based) chain of a given entity type. */
-export function chainColorForType(type, index) {
-  const hue   = CHAIN_HUE_BY_TYPE[type] ?? CHAIN_HUE_BY_TYPE.protein;
-  const cycle = _LIGHT_STEPS.length;
-  const ring  = Math.floor(index / cycle) % _SAT_RINGS.length;
-  const light = _LIGHT_STEPS[index % cycle];
-  const hOff  = _HUE_STEPS[index % cycle];
-  const sat   = _SAT_RINGS[ring];
-  return `hsl(${hue + hOff}, ${sat}%, ${light}%)`;
-}
-
-// Arc colours for crosslink groups (cycle through these)
-export const XL_GROUP_COLORS = [
-  '#1a73e8', '#ea4335', '#34a853', '#fa7b17',
-  '#9334e6', '#007b83', '#c01880', '#e37400',
-];
-
-// Highlight colours for modifications (PTMs / base mods) — a distinct gold/amber
-// family, kept well clear of XL_GROUP_COLORS so a modified residue can never be
-// mistaken for a crosslink anchor at a glance, while still distinguishing
-// different modification types from each other.
-export const MOD_GROUP_COLORS = [
-  '#c9920a', '#8a5a00', '#e0a72e', '#b07d1a',
-];
-
-// Stroke-dasharray values for crosslink groups — each group gets a distinct line style.
+// Stroke-dasharray values: a ninth group reuses the first colour with the next line style.
 // Order: solid → long-dash → short-dash → dash-dot → dotted → very-long → dash-2dot → medium
 export const XL_DASH_PATTERNS = [
   'none',

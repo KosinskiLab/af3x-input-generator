@@ -16,6 +16,9 @@ const AA3TO1 = {
 
 // ─── Format detection ─────────────────────────────────────────────────────────
 
+import { toast, showModal, hideModal } from './ui.js';
+import { esc } from './util.js';
+
 function _detectFileFormat(text) {
   // Some mmCIF files (e.g. AlphaFold3 outputs) start with a long comment/license
   // header before "data_", so scan a generous window rather than just the first
@@ -603,6 +606,110 @@ function _atomSeqFromMmcif(text) {
   })).filter(c => c.sequence.replace(/X/g, '').length > 0);
 }
 
+// ─── Single-chain template mmCIF ─────────────────────────────────────────────
+
+/**
+ * One chain of a PDB / mmCIF file as a minimal template mmCIF.
+ * AF3 needs exactly one polymer chain and a release date in a template, and
+ * counts template residues along the chain. Only residues with coordinates are
+ * written, numbered 1…N, so position k (0-based) in `sequence` is template index k.
+ * Returns { mmcif, sequence }.
+ */
+export function buildTemplate(text, chainId, dataName = 'template') {
+  const isCif = _detectFileFormat(text) === 'mmcif';
+  const atoms = isCif ? _chainAtomsFromMmcif(text, chainId) : _chainAtomsFromPdb(text, chainId);
+  if (!atoms.length) throw new Error(`Chain ${chainId} has no atoms`);
+
+  let date = null;
+  if (isCif) {
+    const m = text.match(/_pdbx_audit_revision_history\.revision_date\s+(\d{4}-\d{2}-\d{2})/) ||
+              text.match(/_pdbx_audit_revision_history[\s\S]{0,600}?\s(\d{4}-\d{2}-\d{2})\s/);
+    date = m ? m[1] : null;
+  } else {
+    date = _pdbDepositionDate(text);
+  }
+  date = date || new Date().toISOString().slice(0, 10);
+
+  const q = v => (/['"\s]/.test(v) ? (v.includes('"') ? `'${v}'` : `"${v}"`) : v);
+  const rows = [];
+  const resnames = [];
+  let lastKey = null;
+  atoms.forEach((a, i) => {
+    if (a.resKey !== lastKey) { lastKey = a.resKey; resnames.push(a.resName); }
+    rows.push([
+      'ATOM', i + 1, a.elem, q(a.atomName), '.', a.resName, 'A', '1', resnames.length, '?',
+      a.x, a.y, a.z, a.occ, a.b, '?', a.authSeq || resnames.length, 'A', '1',
+    ].join(' '));
+  });
+
+  const name = String(dataName).replace(/[^A-Za-z0-9_]/g, '_').slice(0, 40) || 'template';
+  let out = `data_${name}\n#\n`;
+  out += `_entry.id ${name}\n#\n`;
+  out += `loop_\n_pdbx_audit_revision_history.revision_date\n${date}\n#\n`;
+  out += 'loop_\n' + ATOM_SITE_COLUMNS.map(c => `_atom_site.${c}`).join('\n') + '\n';
+  out += rows.join('\n') + '\n#\n';
+  return { mmcif: out, sequence: resnames.map(r => AA3TO1[r] || 'X').join('') };
+}
+
+function _chainAtomsFromPdb(text, chainId) {
+  const atoms = [];
+  for (const line of text.split('\n')) {
+    if (line.startsWith('ENDMDL')) break;            // first model only
+    if (!line.startsWith('ATOM')) continue;
+    if ((line[21] || ' ') !== chainId) continue;
+    const alt = line[16] || ' ';
+    if (alt !== ' ' && alt !== 'A') continue;
+    const atomName = line.slice(12, 16).trim();
+    const x = line.slice(30, 38).trim(), y = line.slice(38, 46).trim(), z = line.slice(46, 54).trim();
+    if (!atomName || x === '' || y === '' || z === '') continue;
+    const resSeq = line.slice(22, 26).trim();
+    atoms.push({
+      atomName, resName: line.slice(17, 20).trim().toUpperCase(),
+      resKey: `${resSeq}${line[26] || ' '}`, authSeq: resSeq,
+      x, y, z,
+      occ: line.slice(54, 60).trim() || '1.00', b: line.slice(60, 66).trim() || '0.00',
+      elem: line.slice(76, 78).trim() || (atomName.match(/[A-Za-z]/) || ['C'])[0],
+    });
+  }
+  return atoms;
+}
+
+function _chainAtomsFromMmcif(text, chainId) {
+  const loop = _mmcifFindLoop(text, '_atom_site.group_PDB');
+  if (!loop) return [];
+  const col = name => loop.columns.indexOf(`_atom_site.${name}`);
+  const iGroup = col('group_PDB'), iComp = col('label_comp_id'), iAtom = col('label_atom_id');
+  const iAsym = col('label_asym_id') >= 0 ? col('label_asym_id') : col('auth_asym_id');
+  const iSeq = col('label_seq_id'), iAuthSeq = col('auth_seq_id'), iIns = col('pdbx_PDB_ins_code');
+  const iAlt = col('label_alt_id'), iModel = col('pdbx_PDB_model_num'), iElem = col('type_symbol');
+  const iX = col('Cartn_x'), iY = col('Cartn_y'), iZ = col('Cartn_z'), iOcc = col('occupancy'), iB = col('B_iso_or_equiv');
+  const atoms = [];
+  let firstModel = null;
+  for (const row of loop.rows) {
+    if (iGroup >= 0 && row[iGroup] !== 'ATOM') continue;
+    if (row[iAsym] !== chainId) continue;
+    if (iModel >= 0) {
+      if (firstModel === null) firstModel = row[iModel];
+      else if (row[iModel] !== firstModel) continue;
+    }
+    if (iAlt >= 0) {
+      const alt = row[iAlt];
+      if (alt && alt !== '.' && alt !== '?' && alt !== 'A') continue;
+    }
+    const seqId = (iSeq >= 0 && row[iSeq] !== '.') ? row[iSeq] : (iAuthSeq >= 0 ? row[iAuthSeq] : '');
+    const atomName = row[iAtom];
+    atoms.push({
+      atomName, resName: (row[iComp] || '').toUpperCase(),
+      resKey: `${seqId}_${iIns >= 0 ? row[iIns] : ''}`,
+      authSeq: iAuthSeq >= 0 && /^-?\d+$/.test(row[iAuthSeq]) ? row[iAuthSeq] : '',
+      x: row[iX], y: row[iY], z: row[iZ],
+      occ: iOcc >= 0 ? row[iOcc] : '1.00', b: iB >= 0 ? row[iB] : '0.00',
+      elem: iElem >= 0 ? row[iElem] : (atomName.match(/[A-Za-z]/) || ['C'])[0],
+    });
+  }
+  return atoms;
+}
+
 // ─── Import modal ─────────────────────────────────────────────────────────────
 
 let _pdbChains  = [];
@@ -618,12 +725,12 @@ export function openPdbModal(text, onImport) {
   _pdbChains   = fmt === 'mmcif' ? parseMmCIF(text) : parsePDB(text);
 
   if (!_pdbChains.length) {
-    alert('No chains found in the file. Make sure it is a valid PDB or mmCIF file.');
+    toast('No chains found in this PDB / mmCIF file', { type: 'error' });
     return;
   }
 
   _renderPdbModal(_pdbChains);
-  document.getElementById('pdb-modal').style.display = 'flex';
+  showModal('pdb-modal');
 }
 
 function _renderPdbModal(chains) {
@@ -635,11 +742,11 @@ function _renderPdbModal(chains) {
 
   const summary = document.getElementById('pdbSummary');
   const parts = [];
-  if (typeCounts.protein) parts.push(`${typeCounts.protein} protein chain${typeCounts.protein>1?'s':''}`);
+  if (typeCounts.protein) parts.push(`${typeCounts.protein} protein${typeCounts.protein>1?'s':''}`);
   if (typeCounts.rna)     parts.push(`${typeCounts.rna} RNA`);
   if (typeCounts.dna)     parts.push(`${typeCounts.dna} DNA`);
   if (typeCounts.ligand)  parts.push(`${typeCounts.ligand} ligand${typeCounts.ligand>1?'s':''}`);
-  summary.textContent = parts.join(', ') || 'No recognizable chains';
+  summary.textContent = parts.join(' · ');
 
   chains.forEach((chain, i) => {
     const row = document.createElement('div');
@@ -650,18 +757,13 @@ function _renderPdbModal(chains) {
     cb.id      = `pdbCb_${i}`;
     cb.checked = chain.type !== 'ligand'; // include proteins/RNA/DNA by default, not ligands
 
-    const typeBadge = `<span class="pdb-type-badge pdb-type-${chain.type}">${chain.type}</span>`;
-    const seqPreview = chain.sequence
-      ? `<span class="pdb-seq-preview">${chain.sequence.slice(0, 30)}${chain.sequence.length > 30 ? '…' : ''}</span> <span class="pdb-seq-len">${chain.sequence.length} ${chain.type === 'dna' || chain.type === 'rna' ? 'nt' : 'aa'}</span>`
-      : (chain.ccdCode ? `<span class="pdb-seq-preview">${chain.ccdCode}</span>` : '');
-
+    const unit = chain.type === 'dna' || chain.type === 'rna' ? 'nt' : 'aa';
+    const sub = chain.sequence ? `${chain.sequence.length} ${unit}` : esc(chain.ccdCode || '');
     row.innerHTML = `
-      <input type="checkbox" class="pdb-chain-cb" id="pdbCb_${i}" data-idx="${i}" ${cb.checked ? 'checked' : ''}>
-      <label for="pdbCb_${i}" class="pdb-chain-label">
-        <span class="pdb-chain-id">Chain ${chain.chainId}</span>
-        ${typeBadge}
-        <span class="pdb-entity-name">${chain.entityName || ''}</span>
-        ${seqPreview}
+      <label class="pick-row">
+        <input type="checkbox" class="pdb-chain-cb" data-idx="${i}" ${cb.checked ? 'checked' : ''}>
+        <span class="pick-main"><b>${esc(chain.chainId)}</b> ${esc(chain.type)} <span class="pick-name">${esc(chain.entityName || '')}</span></span>
+        <span class="pick-sub">${sub}</span>
       </label>`;
 
     list.appendChild(row);
@@ -669,13 +771,11 @@ function _renderPdbModal(chains) {
 }
 
 export function initPdbModal() {
-  document.getElementById('pdbModalClose').onclick   = _closePdbModal;
-  document.getElementById('pdbImportCancel').onclick = _closePdbModal;
   document.getElementById('pdbImportConfirm').onclick = _confirmPdbImport;
 }
 
 function _closePdbModal() {
-  document.getElementById('pdb-modal').style.display = 'none';
+  hideModal('pdb-modal');
   _pdbChains   = [];
   _onPdbImport = null;
 }
@@ -687,10 +787,7 @@ function _confirmPdbImport() {
     if (_pdbChains[idx]) selected.push(_pdbChains[idx]);
   });
 
-  if (!selected.length) {
-    alert('No chains selected.');
-    return;
-  }
+  if (!selected.length) return;
 
   if (_onPdbImport) _onPdbImport(selected);
   _closePdbModal();

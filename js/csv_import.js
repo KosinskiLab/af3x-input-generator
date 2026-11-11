@@ -11,6 +11,7 @@
  */
 
 import { CROSSLINKERS } from './data.js';
+import { toast, showModal, hideModal } from './ui.js';
 
 // ─── CSV parsing ──────────────────────────────────────────────────────────────
 
@@ -169,31 +170,32 @@ let _modalData        = null;  // { format, pairs, proteins, headers }
 let _onImport         = null;  // callback
 let _genericCols      = { col1: '', col2: '' };
 let _fetchedSequences = {};    // protein → sequence string
+let _chains           = [];    // existing protein chains: [{ id, label, hasSeq }]
+let _nextFreeIds      = n => Array.from({ length: n }, (_, i) => String.fromCharCode(65 + i));
 
 // ─── Open modal ───────────────────────────────────────────────────────────────
 
-/** Open the CSV import modal. Only xiNET / xiVIEW CSV exports are accepted. */
-export function openImportModal(csvText, onImport) {
+/**
+ * Open the CSV import modal (xiVIEW / xiNET only).
+ * chains: existing protein chains [{ id, label, hasSeq }]; nextFreeIds(n): unused chain IDs.
+ * onImport(pairs, xlName, proteinToChain, sequences)
+ */
+export function openImportModal(csvText, onImport, chains = [], nextFreeIds = null) {
   _onImport = onImport;
   _genericCols = { col1: '', col2: '' };
+  _chains = chains;
+  if (nextFreeIds) _nextFreeIds = nextFreeIds;
+  _fetchedSequences = {};
 
   const raw = parseCSVFile(csvText);
-  if (!raw) { alert('Could not parse the CSV file — is it empty?'); return; }
-
-  if (raw.format === 'unknown') {
-    alert(
-      'This file format was not recognized as xiNET or xiVIEW.\n\n' +
-      'Only xiNET and xiVIEW CSV exports are supported. If your crosslinks ' +
-      'come from another tool (pLink, MeroX, XlinkX, MS Annika, Scout, ' +
-      'MaxQuant/MaxLynx, …), please convert the file to xiNET or xiVIEW ' +
-      'format yourself first (e.g. via pyXLMS) and re-import it here.'
-    );
+  if (!raw || raw.format === 'unknown' || !raw.pairs.length) {
+    toast('Not an xiVIEW or xiNET CSV. Convert other formats first, for example with pyXLMS.', { type: 'error' });
     return;
   }
 
   _modalData = raw;
   _showMainContent(raw);
-  document.getElementById('csv-modal').style.display = 'flex';
+  showModal('csv-modal');
 }
 
 // ─── Render main import content ───────────────────────────────────────────────
@@ -201,12 +203,11 @@ export function openImportModal(csvText, onImport) {
 function _showMainContent(data) {
   const { format, pairs, proteins } = data;
 
-  document.getElementById('csvMainContent').style.display = '';
-
-  document.getElementById('csvFormatBadge').textContent =
-    format === 'xiview' ? 'xiVIEW (AbsPos)' :
-    format === 'xinet'  ? 'xiNET (LinkPos)'  : 'Generic';
-  document.getElementById('csvTotalCount').textContent = `${pairs.length} pairs found`;
+  document.getElementById('csvFormatBadge').textContent = format === 'xiview' ? 'xiVIEW' : 'xiNET';
+  document.getElementById('csvTotalCount').textContent = `${pairs.length} pairs`;
+  document.getElementById('csvMinScore').value = '';
+  document.getElementById('csvOnlyInter').checked = false;
+  document.getElementById('csvSelectAll').checked = true;
 
   _renderProteinMapping(proteins);
   _renderCsvCrosslinkerSelect();
@@ -225,6 +226,7 @@ function _renderProteinMapping(proteins) {
   container.innerHTML = '';
 
   const hasUniProt = proteins.some(p => _extractUniprotAcc(p) !== null);
+  const defaults = _defaultMapping(proteins);
 
   const headerRow = document.createElement('div');
   headerRow.className = 'mapping-header-row';
@@ -235,15 +237,16 @@ function _renderProteinMapping(proteins) {
   selectAllCb.checked = true;
   const selectAllLabel = document.createElement('label');
   selectAllLabel.htmlFor = 'mappingSelectAll';
-  selectAllLabel.textContent = 'Select all';
+  selectAllLabel.textContent = 'All';
   selectAllLabel.className = 'mapping-select-all-label';
   headerRow.appendChild(selectAllCb);
   headerRow.appendChild(selectAllLabel);
 
   if (hasUniProt) {
     const fetchBtn = document.createElement('button');
-    fetchBtn.className = 'btn btn-outline btn-sm fetch-all-uniprot-btn';
+    fetchBtn.className = 'btn sm fetch-all-uniprot-btn';
     fetchBtn.textContent = 'Fetch sequences from UniProt';
+    fetchBtn.title = 'Fills chains that have no sequence yet';
     fetchBtn.addEventListener('click', () => _fetchAllSequences(container, proteins));
     const fetchStatus = document.createElement('span');
     fetchStatus.className = 'fetch-all-status';
@@ -271,7 +274,7 @@ function _renderProteinMapping(proteins) {
 
     const label = document.createElement('span');
     label.className = 'mapping-protein-name';
-    label.textContent = _shortProteinName(prot);
+    label.textContent = shortProteinName(prot);
     label.title = prot;
 
     const arrow = document.createElement('span');
@@ -281,10 +284,13 @@ function _renderProteinMapping(proteins) {
     const input = document.createElement('input');
     input.type = 'text';
     input.className = 'mapping-chain-input';
-    input.placeholder = 'Chain ID (e.g. A)';
+    input.placeholder = 'ID';
+    input.setAttribute('aria-label', 'Chain ID');
     input.dataset.protein = prot;
-    input.value = String.fromCharCode(65 + i);
+    input.value = defaults[prot];
     input.maxLength = 4;
+    input.spellcheck = false;
+    input.addEventListener('input', () => { input.value = input.value.toUpperCase().replace(/[^A-Z]/g, ''); });
 
     row.appendChild(cb);
     row.appendChild(label);
@@ -309,6 +315,24 @@ function _renderProteinMapping(proteins) {
     });
     _applyFiltersAndRender();
   });
+}
+
+/** Proteins that match an existing chain by name keep it; the rest get unused IDs. */
+function _defaultMapping(proteins) {
+  const map = {};
+  const taken = new Set();
+  const norm = s => String(s || '').toLowerCase();
+  for (const prot of proteins) {
+    const names = [norm(shortProteinName(prot)), norm(_extractUniprotAcc(prot)), norm(prot)].filter(Boolean);
+    const hit = _chains.find(c => c.label && !taken.has(c.id) && names.includes(norm(c.label)));
+    if (hit) { map[prot] = hit.id; taken.add(hit.id); }
+  }
+  const rest = proteins.filter(p => !map[p]);
+  // with no names to go by, existing chains without a match are used in order
+  const unnamed = _chains.filter(c => !taken.has(c.id) && !c.label);
+  const fresh = _nextFreeIds(rest.length);
+  rest.forEach(p => { map[p] = unnamed.length ? unnamed.shift().id : fresh.shift(); });
+  return map;
 }
 
 function _setProteinRowEnabled(row, enabled) {
@@ -343,32 +367,31 @@ function _renderCsvCrosslinkerSelect() {
     if (xl.dynamic) return;
     const opt = document.createElement('option');
     opt.value = xl.name;
-    opt.textContent = xl.name + (xl.symmetric ? '' : ' ⚠ asymmetric');
+    opt.textContent = xl.name + (xl.symmetric ? '' : ' (asymmetric)');
     sel.appendChild(opt);
   });
   ['LINK', 'RIGID'].forEach(type => {
     const opt = document.createElement('option');
     opt.value = type + '_dynamic';
-    opt.textContent = `${type}<n> (dynamic — enter n below)`;
+    opt.textContent = `${type} n`;
     sel.appendChild(opt);
   });
 
   sel.onchange = () => {
     const isDyn = sel.value.endsWith('_dynamic');
-    document.getElementById('csvDynamicN').style.display = isDyn ? 'inline-block' : 'none';
+    document.getElementById('csvDynamicN').hidden = !isDyn;
     _checkAsymmetricWarning(sel.value);
   };
+  document.getElementById('csvDynamicN').hidden = true;
+  _checkAsymmetricWarning(sel.value);
 }
 
 function _checkAsymmetricWarning(xlName) {
   const xl   = CROSSLINKERS.find(x => x.name === xlName);
   const warn = document.getElementById('csvAsymWarning');
-  if (xl && !xl.symmetric && !xl.dynamic) {
-    warn.style.display = 'block';
-    warn.textContent = `⚠ ${xl.asymmetricNote}`;
-  } else {
-    warn.style.display = 'none';
-  }
+  const asym = !!(xl && !xl.symmetric && !xl.dynamic);
+  warn.hidden = !asym;
+  warn.textContent = asym ? 'The NHS-ester end is put first in the JSON.' : '';
 }
 
 // ─── Table ────────────────────────────────────────────────────────────────────
@@ -393,7 +416,6 @@ function _applyFiltersAndRender() {
 function _renderTable(pairs) {
   const tbody = document.getElementById('csvTableBody');
   tbody.innerHTML = '';
-  document.getElementById('csvFilteredCount').textContent = `${pairs.length} shown`;
 
   pairs.forEach(pair => {
     const tr = document.createElement('tr');
@@ -407,9 +429,9 @@ function _renderTable(pairs) {
     tdCheck.appendChild(cb);
 
     const cols = [
-      _shortProteinName(pair.protein1),
+      shortProteinName(pair.protein1),
       pair.pos1,
-      _shortProteinName(pair.protein2),
+      shortProteinName(pair.protein2),
       pair.pos2,
       pair.score !== null ? pair.score.toFixed(3) : '—',
       pair.linkType || '—',
@@ -419,7 +441,7 @@ function _renderTable(pairs) {
     cols.forEach(val => {
       const td = document.createElement('td');
       td.textContent = val;
-      if (pair.ambiguous) td.style.color = '#fa7b17';
+      if (pair.ambiguous) { td.classList.add('ambiguous'); td.title = 'Ambiguous: the first protein match is used'; }
       tr.appendChild(td);
     });
 
@@ -439,7 +461,8 @@ function _toggleSelectAll() {
 function _updateSelectedCount() {
   const total    = document.querySelectorAll('#csvTableBody .pair-checkbox').length;
   const selected = document.querySelectorAll('#csvTableBody .pair-checkbox:checked').length;
-  document.getElementById('csvSelectedCount').textContent = `${selected} / ${total} selected`;
+  document.getElementById('csvSelectedCount').textContent = `${selected} of ${total} selected`;
+  document.getElementById('csvImportConfirm').disabled = selected === 0;
 }
 
 // ─── Confirm / Cancel ─────────────────────────────────────────────────────────
@@ -466,13 +489,11 @@ function _resolveXlName() {
 }
 
 export function initImportModal() {
-  document.getElementById('csvModalClose').onclick    = _closeModal;
-  document.getElementById('csvImportCancel').onclick  = _closeModal;
   document.getElementById('csvImportConfirm').onclick = _confirmImport;
 }
 
 function _closeModal() {
-  document.getElementById('csv-modal').style.display = 'none';
+  hideModal('csv-modal');
   _modalData = null;
   _fetchedSequences = {};
 }
@@ -487,10 +508,7 @@ function _confirmImport() {
     if (cb && cb.checked && tr._pairData) selected.push(tr._pairData);
   });
 
-  if (selected.length === 0) {
-    alert('No crosslink pairs selected.');
-    return;
-  }
+  if (selected.length === 0) return;
 
   const proteinToChain = _buildProteinToChain();
   const xlName         = _resolveXlName();
@@ -498,7 +516,7 @@ function _confirmImport() {
   const missing = [...new Set(selected.flatMap(p => [p.protein1, p.protein2]))]
     .filter(prot => !proteinToChain[prot]);
   if (missing.length > 0) {
-    alert(`Please assign chain IDs for: ${missing.map(_shortProteinName).join(', ')}`);
+    toast(`Give a chain ID to ${missing.map(shortProteinName).join(', ')}`, { type: 'error' });
     return;
   }
 
@@ -546,7 +564,7 @@ async function _fetchAllSequences(container, proteins) {
   await Promise.all(uniProtProteins.map(async prot => {
     const acc      = _extractUniprotAcc(prot);
     const statusEl = container.querySelector(`.fetch-status[data-protein="${CSS.escape(prot)}"]`);
-    if (statusEl) { statusEl.textContent = '⏳'; statusEl.style.color = 'var(--text-3)'; }
+    if (statusEl) { statusEl.textContent = '…'; statusEl.style.color = 'var(--text-3)'; }
 
     try {
       const res = await fetch(`https://rest.uniprot.org/uniprotkb/${acc}.fasta`);
@@ -555,23 +573,23 @@ async function _fetchAllSequences(container, proteins) {
       const seq  = _extractFastaSeq(text);
       if (!seq) throw new Error('empty response');
       _fetchedSequences[prot] = seq;
-      if (statusEl) { statusEl.textContent = `✓ ${seq.length} aa`; statusEl.style.color = '#34a853'; }
+      if (statusEl) { statusEl.textContent = `${seq.length} aa`; statusEl.style.color = 'var(--ok)'; }
     } catch (e) {
-      if (statusEl) { statusEl.textContent = `✗ ${e.message}`; statusEl.style.color = '#ea4335'; }
+      if (statusEl) { statusEl.textContent = 'not found'; statusEl.style.color = 'var(--danger)'; }
     }
   }));
 
   const nOk = uniProtProteins.filter(p => _fetchedSequences[p]).length;
   if (allStatus) {
-    allStatus.textContent = `${nOk} / ${uniProtProteins.length} fetched`;
-    allStatus.style.color = nOk === uniProtProteins.length ? '#34a853' : '#fa7b17';
+    allStatus.textContent = `${nOk} of ${uniProtProteins.length} fetched`;
+    allStatus.style.color = nOk === uniProtProteins.length ? 'var(--ok)' : 'var(--warn)';
   }
   if (btn) btn.disabled = false;
 }
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
-export function _shortProteinName(name) {
+export function shortProteinName(name) {
   if (!name) return '';
   const parts = name.split('|');
   if (parts.length === 3) return parts[2];

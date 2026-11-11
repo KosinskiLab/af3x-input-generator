@@ -6,515 +6,217 @@
   <title>AF3x Input Generator</title>
   <script>
     (function () {
-      var t = localStorage.getItem('af3x_theme') || 'dark';
+      var t = null;
+      try { t = localStorage.getItem('af3x_theme'); } catch (e) {}
+      if (t !== 'light' && t !== 'dark') {
+        t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      }
       document.documentElement.setAttribute('data-theme', t);
     })();
   </script>
   <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
   <link rel="icon" type="image/png" sizes="192x192" href="assets/favicon-192.png">
   <link rel="apple-touch-icon" href="assets/favicon-512.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-  <!-- ─── Header ─────────────────────────────────────────────────────────── -->
-  <header class="site-header">
-    <div class="header-inner">
-      <div class="logo-area">
-        <div class="logo-badge">AF<span>3x</span></div>
-        <div class="logo-text">
-          <span class="logo-title">Input Generator</span>
-          <span class="logo-sub">AF3x — Crosslink Support</span>
-        </div>
-      </div>
-      <nav class="header-nav">
-        <button class="btn btn-ghost btn-sm" id="themeToggleBtn" title="Toggle light/dark theme">🌙</button>
-        <button class="btn btn-ghost btn-sm" id="resetBtn" title="Clear everything and start fresh">↺ Reset</button>
-        <button class="btn btn-outline btn-sm" id="importBtn">Import JSON</button>
-        <a href="https://github.com/KosinskiLab/af3x" target="_blank" rel="noopener"
-           class="btn btn-ghost btn-sm">AF3x GitHub ↗</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><b>AF3<i>x</i></b><span>input generator</span></div>
+
+      <button class="palette-btn" id="paletteBtn" aria-haspopup="menu" aria-expanded="false"
+              title="Disulfides, modifications, MSA, templates, batch export…">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <span>Advanced options</span>
+        <kbd>/</kbd>
+      </button>
+
+      <nav class="topbar-nav">
+        <button class="btn ghost" id="importBtn" title="JSON, FASTA, PDB/mmCIF or crosslink CSV — or drop a file anywhere">Import</button>
+        <button class="btn ghost" id="newBtn" title="Clear everything">New</button>
+        <button class="icon-btn" id="helpBtn" title="Help" aria-label="Help">?</button>
+        <button class="icon-btn" id="themeBtn" title="Light / dark" aria-label="Toggle theme">
+          <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor"/></svg>
+        </button>
+        <a class="icon-btn" href="https://github.com/KosinskiLab/af3x" target="_blank" rel="noopener" title="AF3x on GitHub" aria-label="AF3x on GitHub">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 .2a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.34c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.22 1.88.87 2.33.66.07-.52.28-.87.5-1.07-1.77-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.19c0 .21.15.46.55.38A8 8 0 0 0 8 .2z"/></svg>
+        </a>
       </nav>
     </div>
   </header>
 
-  <!-- ─── App tab bar ─────────────────────────────────────────────────────── -->
-  <div class="app-tab-bar">
-    <button class="app-tab active" data-tab="build">Build</button>
-    <button class="app-tab" data-tab="about">About &amp; Guide</button>
-  </div>
+  <main class="layout">
 
-  <!-- ─── Restore session banner ──────────────────────────────────────────── -->
-  <div id="restoreBanner" class="restore-banner" style="display:none">
-    <span>Session from <strong id="restoreBannerTime"></strong> available.</span>
-    <button class="btn btn-primary btn-sm" id="restoreSessionBtn">Restore</button>
-    <button class="btn btn-ghost btn-sm" id="dismissRestoreBtn">Dismiss</button>
-  </div>
+    <div class="main-col">
 
-  <!-- ─── Main layout ─────────────────────────────────────────────────────── -->
-  <div class="main-layout">
+      <section class="sec" id="chainsSec">
+        <div class="sec-head">
+          <h2>Chains</h2>
+        </div>
+        <div id="chains"></div>
+        <div class="add-row">
+          <button class="btn add" data-add="protein">+ Protein</button>
+          <button class="btn add" data-add="rna">+ RNA</button>
+          <button class="btn add" data-add="dna">+ DNA</button>
+          <button class="btn add" data-add="ligand">+ Ligand</button>
+          <button class="btn ghost" id="chainFileBtn" title="FASTA, PDB or mmCIF">From file</button>
+        </div>
+      </section>
 
-    <!-- ─── Intro / overview banner ───────────────────────────────────────── -->
-    <div class="intro-banner" id="introBanner">
-      <div class="intro-banner-header">
-        <span class="intro-banner-title">Feature Overview</span>
-      </div>
-      <p class="intro-banner-subtitle">
-        This tool helps you build input files for local installations of AlphaFold 3 or AF3x
-        (extends AlphaFold 3 with crosslink support).
-      </p>
-      <button class="btn btn-ghost btn-sm intro-details-btn" id="introCollapseBtn">Show details ▸</button>
-      <div class="intro-banner-body" id="introBannerBody" style="display:none">
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--primary)">Sequences</span>
-          <p>Type or paste a sequence directly, upload a <strong>FASTA</strong> file, fetch it
-            automatically by <strong>UniProt ID</strong>, or import chains and ligands straight
-            out of a <strong>PDB</strong>/<strong>mmCIF</strong> structure file.</p>
+      <section class="sec" id="xlSec">
+        <div class="sec-head">
+          <h2>Crosslinks</h2>
+          <span class="sec-note" id="xlSummary"></span>
         </div>
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--info-blue)">Crosslinks</span>
-          <p>Type chain and residue numbers directly, <strong>click the pick icon</strong> to set
-            positions by clicking residues in the sequence, or import an existing
-            <strong>xiNET</strong> or <strong>xiVIEW</strong> CSV result.</p>
+        <div id="xlGroups"></div>
+        <div class="add-row">
+          <button class="btn add" id="addXlBtn">+ Crosslinker</button>
+          <button class="btn ghost" id="xlCsvBtn" title="xiVIEW or xiNET CSV">Import CSV</button>
+          <span class="add-hint" id="xlHint">or click two residues in a sequence</span>
         </div>
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--accent-gold)">Disulfide Bonds</span>
-          <p>Type cysteine pairs directly, or <strong>click the pick icon</strong> to set both
-            residues by clicking cysteines in the sequence.</p>
+      </section>
+
+      <section class="sec" id="ssSec" hidden>
+        <div class="sec-head"><h2>Disulfide bonds</h2></div>
+        <div id="ssRows" class="rows"></div>
+        <div class="add-row"><button class="btn add" id="addSsBtn">+ Disulfide</button></div>
+      </section>
+
+      <section class="sec" id="bondSec" hidden>
+        <div class="sec-head">
+          <h2>Bonded atoms</h2>
+          <span class="sec-note">chain · residue · atom name</span>
         </div>
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--success)">Modifications</span>
-          <p>Search more than 50 post-translational modifications by name or
-            <strong>CCD code</strong>, then click a residue to set the position.</p>
+        <div id="bondRows" class="rows"></div>
+        <div class="add-row"><button class="btn add" id="addBondBtn">+ Bond</button></div>
+      </section>
+
+      <section class="sec" id="ccdSec" hidden>
+        <div class="sec-head">
+          <h2>Custom ligand definition</h2>
+          <span class="sec-note">CCD mmCIF, used by CCD code in a ligand chain</span>
+          <button class="icon-btn sec-x" id="ccdRemoveBtn" title="Remove" aria-label="Remove">×</button>
         </div>
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--accent-orange)">MSA</span>
-          <p>Runs automatically by default. You can disable it entirely for a chain, or supply
-            your own pre-computed <strong>.a3m</strong> files instead.</p>
+        <div class="ccd-box">
+          <textarea id="userCCD" rows="4" spellcheck="false" placeholder="Paste mmCIF"></textarea>
+          <div class="file-row">
+            <input type="text" id="userCCDPath" placeholder="or a path on the machine that runs AF3x: /path/ligand.cif" spellcheck="false">
+            <label class="btn sm">Upload<input type="file" id="userCCDFile" accept=".cif,.mmcif,.txt" hidden></label>
+          </div>
         </div>
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--danger)">Structural Templates</span>
-          <p>Add custom templates manually — the query/template residue mapping can even be
-            suggested automatically by uploading a <strong>PDB</strong> or
-            <strong>mmCIF</strong> file.</p>
-        </div>
-        <div class="intro-row">
-          <span class="intro-tag" style="--tag-color:var(--text-3)">Output</span>
-          <p>Generate, copy, or download the finished <strong>JSON</strong>, or re-import an
-            existing AF3x <strong>JSON</strong> file to keep editing it.</p>
-        </div>
-      </div>
+      </section>
+
     </div>
 
-    <!-- TOP: Job Settings + Sequences — full width -->
-    <div class="top-section">
+    <aside class="side-col">
+      <div class="side-inner">
 
-      <!-- Job Settings -->
-      <section class="card" style="--section-accent:var(--text-3)">
-        <h2 class="card-title">Job Settings</h2>
-        <div class="field-row" style="margin-top:12px">
-          <div class="field field-grow">
-            <label for="jobName">Job name</label>
-            <input type="text" id="jobName" placeholder="my_complex" autocomplete="off">
-          </div>
-          <div class="field field-seeds">
-            <label>
-              Seeds
-              <span class="label-hint" data-tip="Count: generate seeds 1…N. Exact: use specific seed values, e.g. 5 alone exports [5].">?</span>
-            </label>
-            <div class="seed-seg">
-              <button type="button" class="seed-seg-btn active" data-mode="count">Count</button>
-              <button type="button" class="seed-seg-btn" data-mode="specific">Exact</button>
-            </div>
-            <input type="number" id="seedCount" value="1" min="1" max="100" step="1" autocomplete="off">
-            <input type="text" id="seedSpecific" value="" placeholder="1, 3, 7" autocomplete="off" style="display:none">
-          </div>
-          <div class="field" style="width:72px">
-            <label for="inputVersion">
-              Version
-              <span class="label-hint" data-tip="AF3x input format version. Default is 4 (current). Use 3 for older AF3x installations that don't support v4 fields (e.g. description).">?</span>
-            </label>
-            <input type="number" id="inputVersion" value="4" min="1" max="4" step="1">
-          </div>
-        </div>
-      </section>
-
-      <!-- Sequences -->
-      <section class="card" id="sequences-card" style="--section-accent:var(--primary)">
-        <div class="card-header-row">
-          <h2 class="card-title">Sequences</h2>
-          <span class="seq-count-badge" id="seqCountBadge">0</span>
-          <div class="import-dropdown-wrap" style="margin-left:auto">
-            <button class="btn btn-ghost btn-sm" id="importFromBtn">Import from ▾</button>
-            <div class="dropdown" id="import-dropdown" style="display:none">
-              <button class="dropdown-item" id="importPdbBtn">PDB / mmCIF</button>
-              <button class="dropdown-item" id="importFastaBtn">FASTA file</button>
-              <button class="dropdown-item" id="importUniprotBtn">UniProt ID</button>
-            </div>
-          </div>
-          <input type="file" id="fasta-import-file-input" accept=".fasta,.fa,.faa,.txt,.seq,.a2m" style="display:none">
-          <button class="btn btn-xl-pick btn-sm" id="selectXlBtn" title="Click residues to add crosslink pairs">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0">
-              <path d="M6.5 9.5a3.182 3.182 0 0 0 4.5 0l2-2a3.182 3.182 0 0 0-4.5-4.5L7.5 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-              <path d="M9.5 6.5a3.182 3.182 0 0 0-4.5 0l-2 2a3.182 3.182 0 0 0 4.5 4.5L8.5 12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            Pick XL Residues
+        <div class="job">
+          <label class="field grow">
+            <span>Job name</span>
+            <input type="text" id="jobName" placeholder="my_complex" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field seeds">
+            <span id="seedLabel">Seeds</span>
+            <input type="number" id="seedCount" value="1" min="1" max="1000" step="1" title="Seeds 1…N; each gives 5 models">
+            <input type="text" id="seedList" placeholder="1, 3, 7" autocomplete="off" hidden>
+          </label>
+          <button class="icon-btn" id="jobMoreBtn" title="Seed values, JSON version" aria-label="More job settings" aria-haspopup="true">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M2 4.5h7M12 4.5h2M2 11.5h2M7 11.5h7"/><circle cx="10.5" cy="4.5" r="1.6"/><circle cx="5.5" cy="11.5" r="1.6"/></svg>
           </button>
         </div>
-        <p class="card-hint">
-          Add a chain by typing/pasting a sequence, uploading a <strong>FASTA</strong> file, or
-          fetching it by <strong>UniProt ID</strong>. <strong>Import PDB / mmCIF</strong> reads
-          chains (and ligands) directly out of a structure file. Use
-          <strong>Pick XL Residues</strong> to set crosslink positions by clicking residues below
-          instead of typing numbers.
-        </p>
-        <div id="sequences-container"></div>
-        <div class="add-entity-row">
-          <button class="btn-add-entity protein" data-seqtype="protein">+ Protein</button>
-          <button class="btn-add-entity rna"     data-seqtype="rna">+ RNA</button>
-          <button class="btn-add-entity dna"     data-seqtype="dna">+ DNA</button>
-          <button class="btn-add-entity ligand"  data-seqtype="ligand">+ Ligand</button>
-        </div>
 
-        <!-- User CCD (advanced) — global, but only shown once a Ligand chain exists -->
-        <details class="card-advanced seq-level-advanced" id="userCcdSection" style="display:none">
-          <summary class="card-title">
-            Custom CCD <span class="optional-tag">optional · expert · for Ligands</span>
-          </summary>
-          <p class="card-hint">
-            Custom ligand definitions not in the standard CCD — referenced by
-            <strong>CCD code</strong> from any Ligand chain above. Provide inline mmCIF content
-            (<code>userCCD</code>) <em>or</em> a file path (<code>userCCDPath</code>), not both.
-          </p>
-          <div class="field" style="margin-bottom:10px">
-            <div class="field-label-row">
-              <label for="userCCD">Inline mmCIF content</label>
-              <label class="btn btn-ghost btn-xs msa-upload-label" title="Upload a .cif/.mmcif/.pdb file — its raw text is embedded inline as userCCD">
-                Upload file <input type="file" id="userCCDFile" accept=".cif,.mmcif,.pdb,.ent,.txt" style="display:none">
-              </label>
-            </div>
-            <textarea id="userCCD" rows="4" placeholder="Paste mmCIF content here, or upload a .cif / .mmcif / .pdb file above…"></textarea>
-          </div>
-          <div class="field">
-            <label for="userCCDPath">CCD file path (.cif / .cif.gz / .cif.xz / .cif.zst)</label>
-            <input type="text" id="userCCDPath" placeholder="/path/to/custom_ligand.cif">
-          </div>
-        </details>
-      </section>
-
-    </div><!-- /top-section -->
-
-    <!-- BOTTOM: Constraints | Topology — two-column -->
-    <div class="bottom-section">
-      <div class="constraints-col">
-
-      <!-- Crosslinks -->
-      <section class="card" id="crosslinks-card" style="--section-accent:var(--info-blue)">
-        <div class="card-header-row">
-          <h2 class="card-title">Crosslinks <span class="optional-tag">optional</span></h2>
-          <div class="card-header-actions">
-            <button class="btn btn-ghost btn-sm" id="importCsvBtn"
-                    title="Only xiNET or xiVIEW CSV exports are accepted — convert other formats (pLink, MeroX, XlinkX, …) beforehand">
-              Import xiNET/xiVIEW CSV ↑
-            </button>
-            <button class="btn btn-ghost btn-sm" id="crosslinkerPresetsBtn">Presets ▾</button>
-          </div>
-        </div>
-        <p class="card-hint">
-          Model crosslinker molecules explicitly between residue pairs. Indices are 1-based.
-          Type chain + residue directly, <strong>click the pick icon</strong> on a row (or
-          <strong>Pick XL Residues</strong> above) to set positions by clicking residues in the
-          sequence, or <strong>Import xiNET/xiVIEW CSV</strong> to load pairs from an existing
-          XL-MS result — that import also offers to fetch sequences for the linked proteins by
-          <strong>UniProt ID</strong>.
-        </p>
-        <div id="crosslinks-container"></div>
-        <div id="xl-stats" class="xl-stats" style="display:none"></div>
-        <div class="section-actions">
-          <button class="btn btn-outline btn-sm" id="addCrosslinkGroupBtn">+ Add crosslinker</button>
-        </div>
-        <div id="presets-dropdown" class="dropdown" style="display:none">
-          <div id="presets-list"></div>
-        </div>
-
-      </section>
-
-      <!-- Disulfide Bonds -->
-      <section class="card" style="--section-accent:var(--accent-gold)">
-        <div class="card-header-row">
-          <h2 class="card-title">Disulfide Bonds <span class="optional-tag">optional</span></h2>
-        </div>
-        <p class="card-hint">
-          Cysteine pairs for disulfide bonds. AF3x models these by mutating Cys→Ala and
-          adding an S–S covalent ligand between them. Type positions directly, or
-          <strong>click the pick icon</strong> on a row to set both residues by clicking
-          cysteines in the sequence.
-        </p>
-        <div id="ss-bonds-container"></div>
-        <div class="section-actions">
-          <button class="btn btn-outline btn-sm" id="addSsBondBtn">+ Add S–S bond</button>
-        </div>
-      </section>
-
-      <!-- Bonded Atom Pairs (advanced) -->
-      <details class="card card-advanced" style="--section-accent:var(--accent-orange)">
-        <summary class="card-title">
-          Bonded Atom Pairs <span class="optional-tag">optional · advanced</span>
-        </summary>
-        <p class="card-hint">
-          Explicit covalent bonds between atoms (e.g. covalently bound ligands, glycans).
-          Address by chain ID, 1-based residue number, and atom name.
-        </p>
-        <div id="bonds-container"></div>
-        <div class="section-actions">
-          <button class="btn btn-outline btn-sm" id="addBondBtn">+ Add bond</button>
-        </div>
-      </details>
-
-      <!-- Batch export / Screening -->
-      <div class="generate-area">
-        <details id="batchPanel" class="batch-panel" style="display:none">
-          <summary class="batch-summary">Batch export / Screening</summary>
-          <div class="batch-body">
-
-            <!-- Single XL -->
-            <div class="batch-section">
-              <div class="batch-section-title">Single crosslink — one JSON per pair</div>
-              <p class="batch-hint">
-                Generates one JSON file per crosslink pair, with all other settings
-                (sequences, MSA, seeds) identical. Useful for testing each restraint individually.
-              </p>
-              <div class="batch-row">
-                <span id="batchSingleInfo" class="batch-info-inline"></span>
-                <button id="batchSingleBtn" class="btn btn-outline btn-sm">Download ZIP</button>
-              </div>
-            </div>
-
-            <!-- Random combos -->
-            <div class="batch-section">
-              <div class="batch-section-title">Random combinations — screening</div>
-              <p class="batch-hint">
-                Randomly sample K crosslinks per prediction job. Use when you have many
-                potential restraints and want to screen which combinations improve structure quality.
-              </p>
-              <div class="batch-row">
-                <label class="batch-label">
-                  XLs per job
-                  <input type="number" id="batchComboK" value="5" min="1" max="500"
-                         class="batch-num-input">
-                </label>
-                <label class="batch-label">
-                  Number of jobs
-                  <input type="number" id="batchComboM" value="20" min="1" max="500"
-                         class="batch-num-input">
-                </label>
-                <button id="batchComboBtn" class="btn btn-outline btn-sm">Download ZIP</button>
-              </div>
-              <div id="batchComboInfo" class="batch-info"></div>
-            </div>
-
-          </div>
-        </details>
-      </div>
-
-      </div><!-- /constraints-col -->
-
-      <!-- Topology + Output -->
-      <div class="viz-col">
-      <div class="viz-sticky">
-
-        <!-- Structure Topology -->
-        <div class="card viz-card">
-          <div class="card-header-row">
-            <h2 class="card-title">Structure Topology</h2>
-            <div style="display:flex;align-items:center;gap:8px">
-              <span class="viz-hint" id="vizHint">live preview</span>
-              <button id="expandTopologyBtn" class="btn btn-ghost btn-xs topo-expand-btn" title="Open interactive view">⤢ Expand</button>
-            </div>
-          </div>
-          <div id="arc-diagram-wrap">
-            <svg id="arc-svg" width="100%" height="100"></svg>
-          </div>
+        <div class="diagram">
+          <button class="icon-btn diagram-expand" id="expandDiagramBtn" title="Open large view" aria-label="Open large view">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 2H14v4.5M14 2 9 7M6.5 14H2V9.5M2 14l5-5"/></svg>
+          </button>
+          <svg id="arc-svg" width="100%" height="60"></svg>
           <div id="arc-legend"></div>
         </div>
 
-        <!-- JSON Output -->
-        <div class="card output-card">
-          <button class="btn btn-primary btn-generate-main" id="generateBtn">Generate JSON</button>
-          <div class="card-header-row output-header">
-            <h2 class="card-title">JSON Output</h2>
-            <div class="output-actions">
-              <button class="btn btn-ghost btn-sm" id="expandJsonBtn" style="display:none" title="Open larger view">⤢ Expand</button>
-              <button class="btn btn-ghost btn-sm" id="copyJsonBtn" style="display:none">Copy</button>
-              <a id="downloadJsonLink" class="btn btn-outline btn-sm" style="display:none"
-                 download="alphafold3_input.json">Download</a>
-            </div>
+        <div id="issues" aria-live="polite"></div>
+
+        <div class="export">
+          <div class="split">
+            <button class="btn primary" id="downloadBtn">Download JSON</button>
+            <button class="btn primary" id="downloadMoreBtn" aria-label="More export options" aria-haspopup="menu" title="Batch export">
+              <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 3.5 5 7l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
           </div>
-          <div id="outputStaleBanner" style="display:none">
-            <span class="stale-icon">⚠</span>
-            <span>Inputs changed — regenerate to update the download</span>
-            <button class="stale-regen-btn" onclick="document.getElementById('generateBtn').click()">Regenerate</button>
-          </div>
-          <pre id="jsonOutput" class="json-output"><span class="json-placeholder">// Click "Generate JSON" above to build output</span></pre>
-          <div id="json-validation-panel" style="display:none"></div>
+          <button class="btn" id="copyBtn">Copy</button>
         </div>
 
+        <details class="json-details" id="jsonDetails">
+          <summary>JSON</summary>
+          <pre id="jsonOut" class="json-out"></pre>
+        </details>
+
       </div>
-      </div><!-- /viz-col -->
-    </div><!-- /bottom-section -->
+    </aside>
 
-  </div><!-- /main-layout -->
+  </main>
 
-  <!-- ─── About / Guide panel ─────────────────────────────────────────────── -->
-  <div class="about-layout" id="about-panel" style="display:none">
-    <div class="about-inner">
+  <!-- ─── Help ──────────────────────────────────────────────────────────── -->
+  <div class="modal" id="help-modal" hidden role="dialog" aria-modal="true" aria-label="Help">
+    <div class="modal-box wide">
+      <div class="modal-head"><h3>Help</h3><button class="icon-btn" data-close aria-label="Close">×</button></div>
+      <div class="modal-body help">
 
-      <!-- Intro -->
-      <section class="about-section">
-        <h2>What is AF3x?</h2>
         <p>
-          <strong>AF3x</strong> is a modified version of AlphaFold 3 developed at the
+          Builds input JSON files for <a href="https://github.com/KosinskiLab/af3x" target="_blank" rel="noopener">AF3x</a>,
+          the AlphaFold 3 fork from the
           <a href="https://www.embl.org/groups/kosinski/" target="_blank" rel="noopener">Kosinski Lab (EMBL)</a>
-          that models <strong>crosslinks explicitly</strong>: each crosslinker is added as a small-molecule
-          ligand, covalently bonded to both crosslinked residues, instead of a distance restraint.
+          that models each crosslink as a linker molecule bonded to both residues. Files without crosslinks
+          also run in plain AlphaFold 3.
         </p>
-        <p>
-          This tool generates the JSON input files required by AF3x. It handles sequences,
-          crosslinker molecules, disulfide bonds, post-translational modifications, custom
-          <strong>MSA</strong> and <strong>structural templates</strong>, covalent ligand bonds,
-          a user-provided CCD, and batch export for screening.
-        </p>
-      </section>
 
-      <!-- Quick Start -->
-      <section class="about-section">
-        <h2>Quick Start</h2>
-        <ol class="about-steps">
-          <li>
-            <strong>Add sequences</strong> — click <em>+ Protein / RNA / DNA / Ligand</em> and paste your
-            sequence or CCD code. Import a PDB/mmCIF or FASTA file for quick setup.
-            Each chain gets an auto-assigned letter (A, B, C…).
-          </li>
-          <li>
-            <strong>Add crosslinks</strong> — click <em>+ Add crosslinker</em>, choose a preset from the
-            dropdown, then enter chain + residue pairs. Use <em>Pick XL Residues</em> to click directly
-            in the sequence view. One residue position may only appear in one crosslink pair per crosslinker group.
-          </li>
-          <li>
-            <strong>Optional constraints</strong> — add disulfide bonds, modifications (PTMs), or
-            bonded atom pairs as needed. Open <em>Advanced options</em> on a chain for MSA and
-            structural templates.
-          </li>
-          <li>
-            <strong>Set seeds</strong> — enter a number <em>N</em> to generate seeds 1…N, or enter them
-            manually (e.g. <code>1,2,3,5</code>). More seeds = more diverse model ensemble.
-          </li>
-          <li>
-            <strong>Generate</strong> — click <em>Generate JSON</em>. Download the file and pass it to
-            AF3x as the <code>--input_json</code> argument.
-          </li>
-          <li>
-            <strong>Batch export</strong> — expand <em>Batch export / Screening</em> to download one JSON
-            per crosslink pair, or random subsets of crosslinks across many jobs.
-          </li>
+        <h4>Quick start</h4>
+        <ol>
+          <li>Paste a sequence, FASTA or UniProt ID into a chain, or drop a FASTA / PDB / mmCIF file on the page.</li>
+          <li>Click two residues to crosslink them, type the pairs, or import an xiVIEW / xiNET CSV.</li>
+          <li>Name the job and download the JSON. Run it with <code>run_alphafold.py --json_path=job.json</code>.</li>
         </ol>
-      </section>
-
-      <!-- MSA & Templates -->
-      <section class="about-section">
-        <h2>MSA &amp; Structural Templates</h2>
         <p>
-          Both live under <em>Advanced options</em> on a protein/RNA chain. By default AF3
-          searches for both automatically — you only need to touch these if you want something
-          different.
+          Everything else (disulfides, modifications, MSA, templates, bonded atoms, custom ligands, batch
+          export) is under <b>Advanced options</b> (press <kbd>/</kbd>), in each chain's <b>⋯</b> menu, or in
+          the menu that opens when you click a residue.
         </p>
-        <ul class="about-list">
-          <li><strong>Without MSA</strong> — skip MSA search entirely for this chain
-            (<code>unpairedMsa</code>/<code>pairedMsa</code> set to <code>""</code>). Faster, but
-            usually lower accuracy.</li>
-          <li><strong>+ Add custom MSA</strong> — supply your own pre-computed
-            <code>.a3m</code> file(s) (paste, type a cluster path, or upload) instead of letting
-            AF3 search.</li>
-          <li><strong>Without templates</strong> — disable template search for this chain
-            (<code>templates: []</code>).</li>
-          <li><strong>+ Add template</strong> — supply a single-chain <strong>PDB</strong> or
-            <strong>mmCIF</strong> structure (content, path, or upload — PDB is converted to mmCIF
-            automatically) plus a 0-based residue mapping between your sequence and the
-            template.</li>
-          <li><strong>Align with sequence &amp; suggest indices</strong> — pasting or uploading a
-            structure for a template automatically runs a sequence alignment against it and
-            suggests the query/template index mapping for you to review and apply. This is a
-            convenience built into this tool — AF3x itself has no alignment tool, only the JSON
-            schema, so always check the suggested mapping before trusting it.</li>
+
+        <h4>Crosslinkers</h4>
+        <p>
+          Asymmetric linkers have two different ends: the NHS-ester end goes first. The tool puts the pair in
+          that order in the JSON when only one order is possible. <code>LINK<i>n</i></code> and
+          <code>RIGID<i>n</i></code> are generic linkers of <i>n</i> carbons or fused rings.
+        </p>
+        <div id="helpXlTable"></div>
+
+        <h4>Crosslink CSV</h4>
+        <p>
+          <b>xiVIEW</b> (<code>Protein1, AbsPos1, Protein2, AbsPos2</code>) and <b>xiNET</b>
+          (<code>Protein1, PepPos1, LinkPos1, Protein2, PepPos2, LinkPos2</code>) are read directly. Convert
+          other formats first, for example with
+          <a href="https://github.com/hgb-bin-proteomics/pyXLMS" target="_blank" rel="noopener">pyXLMS</a>.
+        </p>
+
+        <h4>Good to know</h4>
+        <ul>
+          <li>Residue numbers are 1-based positions in the sequence you entered, not PDB numbering.</li>
+          <li>To edit a sequence, click beside its letters or double-click it. Once a chain has crosslinks,
+            modifications or other settings, use the pencil button, so they are not shifted by accident.</li>
+          <li>AF3x drops a crosslink whose residue is already used by an earlier one, unless it runs with
+            <code>--noremove_overlapping_crosslinks</code>.</li>
+          <li>Each seed gives 5 models. More seeds sample more; run time grows with them.</li>
+          <li>A disulfide is modelled as Cys→Ala plus an S–S linker.</li>
+          <li>A chain with custom templates also needs its MSA set to None or Custom (an AlphaFold 3 rule).</li>
+          <li>Template residue mapping is 0-based. Uploading a structure aligns it to the chain and fills the
+            mapping; check it before use. PDB files are converted to mmCIF.</li>
+          <li>MSA, template and ligand files can be uploaded (stored inside the JSON) or given as a path on
+            the machine that runs AF3x.</li>
+          <li>The chain name is saved as <code>description</code> and does not affect the prediction.</li>
         </ul>
-        <p>
-          <strong>Important AF3x rule:</strong> if a chain has custom templates, MSA can no longer
-          be left on Auto for that chain — it must also be explicit (either <em>Without MSA</em> or
-          a custom MSA). This tool warns you and blocks JSON generation if you forget; AF3x itself
-          would otherwise reject the whole job with a "templates set only partially" error.
-        </p>
-      </section>
 
-      <!-- Supported crosslinkers -->
-      <section class="about-section">
-        <h2>Supported Crosslinkers</h2>
-        <p>
-          All crosslinkers below are supported by AF3x and available as presets.
-          Symmetric crosslinkers react with both residues identically; asymmetric crosslinkers
-          have distinct chemistry at each end — residue order matters.
-          <strong>Dynamic linkers</strong> (LINK<em>n</em>, RIGID<em>n</em>) are generated on the fly
-          with a given chain length; the name in the JSON must include the number (e.g. <code>LINK5</code>).
-        </p>
-        <p style="color:var(--text-2);font-size: 13px">
-          Note: <strong>SDA25A</strong> is available in the <em>experimental</em> AF3x branch only.
-          The stable <code>main</code> branch supports SDA, LCSDA, and SDAD but not SDA25A.
-        </p>
-        <div id="about-xl-table-wrap"></div>
-      </section>
-
-      <!-- CSV Import -->
-      <section class="about-section">
-        <h2>Importing Crosslinks from CSV</h2>
-        <p>
-          Click <em>Import from CSV ↑</em> in the Crosslinks section to load an existing XL-MS result file.
-          Two formats are supported natively:
-        </p>
-        <ul class="about-list">
-          <li><strong>xiNET CSV</strong> — output from xiNET / xiSEARCH. Columns: <code>Protein1, PepPos1, PepSeq1, LinkPos1, Protein2, PepPos2, PepSeq2, LinkPos2, …</code></li>
-          <li><strong>xiVIEW CSV</strong> — output from xiVIEW. Columns: <code>Protein1, SeqPos1, Protein2, SeqPos2, …</code></li>
-        </ul>
-        <p>
-          For other search engines (pLink, MeroX, XlinkX, MS Annika, Scout, MaxQuant/MaxLynx…), convert
-          your results to xiNET or xiVIEW CSV format yourself first (e.g. with
-          <a href="https://github.com/hgb-bin-proteomics/pyXLMS" target="_blank" rel="noopener">pyXLMS</a>),
-          then import the converted file here.
-        </p>
-        <p>
-          After chain mapping you can review, filter, and confirm which crosslinks to import.
-        </p>
-      </section>
-
-      <!-- Tips -->
-      <section class="about-section">
-        <h2>Tips &amp; Notes</h2>
-        <ul class="about-list">
-          <li><strong>Residue numbering is 1-based</strong> — position 1 is the first residue in your input sequence, regardless of PDB numbering.</li>
-          <li><strong>Chain IDs</strong> — use the chain ID assigned in the Sequences panel (e.g. A, B). One chain card can represent multiple copies (homodimers) by entering comma-separated IDs: <code>A,B</code>.</li>
-          <li><strong>Asymmetric crosslinkers</strong> — residue 1 is the NHS-ester end (reacts with K/S/T/Y/N-term), residue 2 is the diazirine end (any AA). AF3x requires this order; this tool corrects it automatically on export when only one order is chemically possible.</li>
-          <li><strong>SASD vs Euclidean distance</strong> — the max-distance threshold in each crosslinker preset is a solvent-accessible surface distance (SASD). The Euclidean CB–CB distance is always shorter; a pair passing the Euclidean check may still fail SASD if the path goes around an interface.</li>
-          <li><strong>Seeds</strong> — each model seed gives 5 structural models (diffusion samples), and AF3x ranks all of them. Preferably use 20 seeds (100 models); compute time grows with the number of seeds.</li>
-          <li><strong>Version field</strong> — the AF3x input format version, default 4 (current schema). Use 3 for older AF3x installations that don't support v4 fields.</li>
-          <li><strong>Description field</strong> — a free-text comment per chain (under <em>Advanced options</em>). Purely cosmetic, not used by AF3x for prediction — leave blank unless you want a label in the JSON.</li>
-          <li><strong>User CCD</strong> — for custom ligand definitions not in the standard CCD. Provide inline mmCIF content <em>or</em> a file path, not both.</li>
-          <li><strong>Did the template actually get used?</strong> AF3x accepting a template (skipping its own search) doesn't guarantee the predicted structure closely matches it — templates are a soft signal, not a hard constraint. To check: (1) look for "Skipping MSA and template search… because it already has templates" in the AF3x log, and (2) for a stronger check, run the same job again with <em>Without templates</em> and compare pLDDT/confidence between the two runs, or structurally align the predicted model against the template mmCIF.</li>
-        </ul>
-      </section>
-
-      <!-- Credits -->
-      <section class="about-section">
-        <h2>Credits</h2>
+        <h4>Credits</h4>
         <p>
           Developed by Luca Leon Egger in the
           <a href="https://www.embl.org/groups/kosinski/" target="_blank" rel="noopener">Kosinski Lab</a>,
@@ -527,311 +229,158 @@
           (The UniProt Consortium), available under
           <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
         </p>
-      </section>
 
-      <!-- Privacy -->
-      <section class="about-section">
-        <h2>Privacy</h2>
+        <h4>Privacy</h4>
         <p>
           The generator runs entirely in your browser; your sequences and inputs are not uploaded anywhere.
-          Your current input is autosaved in your browser's local storage; <em>Reset</em> clears it.
-          Fetching by UniProt ID sends that ID to UniProt. The page loads its font from Google Fonts, and
-          the ZIP export loads the JSZip library from jsDelivr; both see your IP address. The site is hosted
-          on GitHub Pages, which logs visitors' IP addresses
+          Your current input is autosaved in your browser's local storage; <em>New</em> clears it.
+          Fetching by UniProt ID sends that ID to UniProt. The ZIP export loads the JSZip library from
+          jsDelivr, which sees your IP address. The site is hosted on GitHub Pages, which logs visitors'
+          IP addresses
           (<a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">GitHub privacy statement</a>).
         </p>
-      </section>
-
+      </div>
     </div>
-  </div><!-- /about-layout -->
+  </div>
 
-  <!-- ─── PTM Picker Modal ─────────────────────────────────────────────────── -->
-  <div id="ptm-modal" class="modal-overlay" style="display:none"
-       role="dialog" aria-modal="true" aria-label="Select modification">
+  <!-- ─── Modification picker ───────────────────────────────────────────── -->
+  <div class="modal" id="ptm-modal" hidden role="dialog" aria-modal="true" aria-label="Modification">
     <div class="modal-box">
-      <div class="modal-header">
-        <h3>Select Modification</h3>
-        <button class="modal-close" id="ptmModalClose" aria-label="Close">✕</button>
-      </div>
-      <div class="modal-search-row">
-        <input type="text" id="ptmSearch" class="modal-search"
-               placeholder="Search by name or CCD code (e.g. phospho, SEP)…" autocomplete="off">
-      </div>
-      <div class="modal-category-tabs" id="ptmCategoryTabs"></div>
+      <div class="modal-head"><h3 id="ptmTitle">Modification</h3><button class="icon-btn" data-close aria-label="Close">×</button></div>
+      <input type="search" id="ptmSearch" class="modal-search" placeholder="Name or CCD code" autocomplete="off" spellcheck="false">
       <div id="ptmList" class="ptm-list" role="listbox"></div>
     </div>
   </div>
 
-  <!-- ─── CSV Import Modal ─────────────────────────────────────────────────── -->
-  <div id="csv-modal" class="modal-overlay" style="display:none"
-       role="dialog" aria-modal="true" aria-label="Import crosslinks from CSV">
-    <div class="modal-box modal-wide">
-
-      <div class="modal-header">
-        <h3>Import Crosslinks from CSV</h3>
-        <button class="modal-close" id="csvModalClose" aria-label="Close">✕</button>
+  <!-- ─── Crosslink CSV import ──────────────────────────────────────────── -->
+  <div class="modal" id="csv-modal" hidden role="dialog" aria-modal="true" aria-label="Import crosslinks">
+    <div class="modal-box wide">
+      <div class="modal-head">
+        <h3>Import crosslinks</h3>
+        <span class="modal-note"><span id="csvFormatBadge"></span> · <span id="csvTotalCount"></span></span>
+        <button class="icon-btn" data-close id="csvModalClose" aria-label="Close">×</button>
       </div>
-
-      <!-- Format info bar -->
-      <div class="csv-format-bar">
-        <span>Format detected: <span class="format-badge" id="csvFormatBadge">—</span></span>
-        <span id="csvTotalCount" style="color:var(--text-2)"></span>
-      </div>
-
-      <div class="csv-scroll-body">
-
-        <!-- Main import content (shown once format is recognized as xiNET/xiVIEW) -->
-        <div id="csvMainContent" style="display:none">
-
-          <!-- Protein → Chain mapping -->
-          <div>
-            <div class="csv-section-title">Map proteins to chain IDs</div>
+      <div class="modal-body" id="csvMainContent">
+        <div class="csv-top">
+          <div class="csv-block">
+            <div class="mini-label">Protein → chain</div>
             <div id="csvProteinMapping"></div>
           </div>
-
-          <!-- Crosslinker selection -->
-          <div>
-            <div class="csv-section-title">Crosslinker type</div>
+          <div class="csv-block">
+            <div class="mini-label">Crosslinker</div>
             <div class="csv-xl-row">
               <select id="csvCrosslinkerSelect"></select>
-              <input type="number" id="csvDynamicN" value="5" min="1" max="50"
-                     style="display:none" title="n value for LINK<n>/RIGID<n>">
+              <input type="number" id="csvDynamicN" value="5" min="1" max="50" hidden title="n">
             </div>
-            <div class="csv-asym-warning" id="csvAsymWarning" style="display:none"></div>
-          </div>
-
-          <!-- Filters -->
-          <div>
-            <div class="csv-section-title">Filter crosslinks</div>
-            <div class="csv-filter-row">
-              <label>
-                Min score:
-                <input type="number" id="csvMinScore" placeholder="e.g. 0.5" step="0.01">
-              </label>
-              <label>
-                <input type="checkbox" id="csvExcludeDecoys" checked>
-                Exclude decoys
-              </label>
-              <label>
-                <input type="checkbox" id="csvOnlyInter">
-                Only inter-protein
-              </label>
+            <div class="note" id="csvAsymWarning" hidden></div>
+            <div class="mini-label" style="margin-top:14px">Filter</div>
+            <div class="csv-filters">
+              <label>Min score <input type="number" id="csvMinScore" step="0.01"></label>
+              <label><input type="checkbox" id="csvExcludeDecoys" checked> No decoys</label>
+              <label><input type="checkbox" id="csvOnlyInter"> Inter-protein only</label>
             </div>
           </div>
-
-          <!-- Selection table -->
-          <div>
-            <div class="csv-table-header">
-              <label style="display:flex;align-items:center;gap:6px;font-size: 13px">
-                <input type="checkbox" id="csvSelectAll" checked>
-                Select all
-              </label>
-              <span id="csvFilteredCount"></span>
-              <span id="csvSelectedCount" style="color:var(--primary);font-weight:600"></span>
-            </div>
-            <div class="csv-table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th></th>
-                    <th>Protein 1</th>
-                    <th>Pos 1</th>
-                    <th>Protein 2</th>
-                    <th>Pos 2</th>
-                    <th>Score</th>
-                    <th>Type</th>
-                  </tr>
-                </thead>
-                <tbody id="csvTableBody"></tbody>
-              </table>
-            </div>
-          </div>
-
-        </div><!-- /csvMainContent -->
-
-      </div><!-- /csv-scroll-body -->
-
-      <div class="modal-footer">
-        <button class="btn btn-ghost" id="csvImportCancel">Cancel</button>
-        <button class="btn btn-primary" id="csvImportConfirm">Import selected</button>
-      </div>
-
-    </div>
-  </div>
-
-  <!-- ─── PDB / mmCIF Import Modal ────────────────────────────────────────── -->
-  <!-- AlphaFold Server JSON import modal -->
-  <div id="server-import-modal" class="modal-overlay" style="display:none"
-       role="dialog" aria-modal="true" aria-label="Import from AlphaFold Server">
-    <div class="modal-box" style="max-width:480px">
-      <div class="modal-header">
-        <h3>Import from AlphaFold Server</h3>
-        <button class="modal-close" id="serverImportClose" aria-label="Close">✕</button>
-      </div>
-      <div style="padding:14px 20px 4px">
-        <div id="serverImportNotes" class="server-import-notes"></div>
-        <div id="serverImportOptions" style="display:none; margin-top:12px">
-          <p style="font-size:12px; color:var(--text-2); margin-bottom:8px">Select what to import:</p>
-          <label id="serverImportMsaRow" class="server-import-option" style="display:none">
-            <input type="checkbox" id="serverImportMsa" checked>
-            <span>Inline MSA <span class="server-import-note">(can be large)</span></span>
-          </label>
-          <label id="serverImportTplRow" class="server-import-option" style="display:none">
-            <input type="checkbox" id="serverImportTpl" checked>
-            <span>Templates <span class="server-import-note">(inline mmCIF + index mappings)</span></span>
-          </label>
+        </div>
+        <div class="csv-table-head">
+          <label><input type="checkbox" id="csvSelectAll" checked> All</label>
+          <span id="csvFilteredCount" hidden></span>
+          <span id="csvSelectedCount"></span>
+        </div>
+        <div class="csv-table-wrap">
+          <table>
+            <thead><tr><th></th><th>Protein 1</th><th>Pos</th><th>Protein 2</th><th>Pos</th><th>Score</th><th>Type</th></tr></thead>
+            <tbody id="csvTableBody"></tbody>
+          </table>
         </div>
       </div>
-      <div class="modal-footer">
-        <button class="btn btn-ghost" id="serverImportCancel">Cancel</button>
-        <button class="btn btn-primary" id="serverImportConfirm">Import</button>
+      <div class="modal-foot">
+        <button class="btn" id="csvImportCancel" data-close>Cancel</button>
+        <button class="btn primary" id="csvImportConfirm">Import</button>
       </div>
     </div>
   </div>
 
-  <div id="pdb-modal" class="modal-overlay" style="display:none"
-       role="dialog" aria-modal="true" aria-label="Import chains from PDB or mmCIF">
+  <!-- ─── Structure / FASTA chain selection ─────────────────────────────── -->
+  <div class="modal" id="pdb-modal" hidden role="dialog" aria-modal="true" aria-label="Import chains">
     <div class="modal-box">
-
-      <div class="modal-header">
-        <h3>Import from PDB / mmCIF</h3>
-        <button class="modal-close" id="pdbModalClose" aria-label="Close">✕</button>
+      <div class="modal-head">
+        <h3>Import chains</h3>
+        <span class="modal-note" id="pdbSummary"></span>
+        <button class="icon-btn" data-close id="pdbModalClose" aria-label="Close">×</button>
       </div>
-
-      <div class="pdb-modal-body">
-        <div class="pdb-summary-bar">
-          Detected: <span id="pdbSummary"></span>
-        </div>
-        <p class="csv-conv-hint">Select which chains to import. Each selected chain becomes a sequence card.</p>
-        <div id="pdbChainList" class="pdb-chain-list"></div>
-      </div>
-
-      <div class="modal-footer">
-        <button class="btn btn-ghost" id="pdbImportCancel">Cancel</button>
-        <button class="btn btn-primary" id="pdbImportConfirm">Import selected</button>
-      </div>
-
-    </div>
-  </div>
-
-  <!-- UniProt import modal -->
-  <div id="uniprot-modal" class="modal-overlay" style="display:none"
-       role="dialog" aria-modal="true" aria-label="Import from UniProt">
-    <div class="modal-box" style="max-width:400px">
-      <div class="modal-header">
-        <h3>Import from UniProt</h3>
-        <button class="modal-close" id="uniprotModalClose" aria-label="Close">✕</button>
-      </div>
-      <div style="padding:16px 20px 8px">
-        <div class="uniprot-row">
-          <input type="text" id="uniprotModalInput" class="uniprot-input"
-                 placeholder="e.g. P04637 or Q9Y6K9" autocomplete="off" style="flex:1">
-          <button class="btn btn-primary btn-sm" id="uniprotModalFetchBtn">Fetch</button>
-        </div>
-        <div id="uniprotModalStatus" class="uniprot-status"></div>
-        <p class="uniprot-credit">
-          Sequences are retrieved from
-          <a href="https://www.uniprot.org" target="_blank" rel="noopener">UniProt</a>
-          (The UniProt Consortium), available under
-          <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
-        </p>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-ghost" id="uniprotModalCancel">Cancel</button>
+      <div class="modal-body"><div id="pdbChainList" class="pick-list"></div></div>
+      <div class="modal-foot">
+        <button class="btn" id="pdbImportCancel" data-close>Cancel</button>
+        <button class="btn primary" id="pdbImportConfirm">Import</button>
       </div>
     </div>
   </div>
 
-  <!-- Hidden file inputs -->
-  <input type="file" id="importFileInput" accept=".json" style="display:none">
-  <input type="file" id="csvFileInput" accept=".csv,.txt,.tsv" style="display:none">
-  <input type="file" id="pdbFileInput" accept=".pdb,.cif,.mmcif,.ent" style="display:none">
+  <div class="modal" id="fasta-modal" hidden role="dialog" aria-modal="true" aria-label="Import sequences">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>Import sequences</h3>
+        <span class="modal-note" id="fastaSummary"></span>
+        <button class="icon-btn" data-close aria-label="Close">×</button>
+      </div>
+      <div class="modal-body"><div id="fastaList" class="pick-list"></div></div>
+      <div class="modal-foot">
+        <button class="btn" data-close>Cancel</button>
+        <button class="btn primary" id="fastaConfirm">Import</button>
+      </div>
+    </div>
+  </div>
 
-  <!-- Floating arc tooltip -->
-  <div id="arc-tooltip"></div>
+  <!-- ─── Batch export ──────────────────────────────────────────────────── -->
+  <div class="modal" id="batch-modal" hidden role="dialog" aria-modal="true" aria-label="Batch export">
+    <div class="modal-box">
+      <div class="modal-head"><h3>Batch export</h3><span class="modal-note" id="batchCount"></span><button class="icon-btn" data-close aria-label="Close">×</button></div>
+      <div class="modal-body batch">
+        <label class="batch-opt">
+          <input type="radio" name="batchMode" value="single" checked>
+          <span><b>One job per crosslink</b><small id="batchSingleInfo"></small></span>
+        </label>
+        <label class="batch-opt">
+          <input type="radio" name="batchMode" value="combo">
+          <span><b>Random subsets</b>
+            <small><input type="number" id="batchK" value="5" min="1" max="500"> crosslinks per job ×
+              <input type="number" id="batchM" value="20" min="1" max="500"> jobs</small>
+          </span>
+        </label>
+        <div class="note" id="batchNote" hidden></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-close>Cancel</button>
+        <button class="btn primary" id="batchGo">Download ZIP</button>
+      </div>
+    </div>
+  </div>
 
-  <!-- Interactive topology modal -->
-  <div id="topology-modal" class="topo-modal-overlay" style="display:none" tabindex="-1">
-    <div class="topo-modal-inner">
-      <div class="topo-modal-header">
-        <div class="topo-modal-title-row">
-          <h2 class="topo-modal-title">Structure Topology</h2>
-          <span class="topo-modal-hint">Scroll to zoom · Drag background to pan · Drag protein bar to reorder</span>
-        </div>
-        <div class="topo-modal-actions">
-          <button id="topoResetView" class="btn btn-outline btn-sm"
-                  onclick="if(window._resetTopologyView) window._resetTopologyView()">Reset view</button>
-          <button id="topoModalClose" class="btn btn-ghost btn-sm"
-                  onclick="document.getElementById('topology-modal').style.display='none'">✕</button>
-        </div>
+  <!-- ─── Large diagram ─────────────────────────────────────────────────── -->
+  <div class="modal" id="topology-modal" hidden tabindex="-1" role="dialog" aria-modal="true" aria-label="Diagram">
+    <div class="modal-box full">
+      <div class="modal-head">
+        <h3>Diagram</h3>
+        <span class="modal-note">scroll: zoom · drag: pan · drag a chain: move</span>
+        <button class="btn sm" id="topoResetView">Reset view</button>
+        <button class="icon-btn" data-close id="topoModalClose" aria-label="Close">×</button>
       </div>
       <svg id="topology-expand-svg" class="topo-expand-svg"></svg>
     </div>
   </div>
 
-  <!-- JSON output expand modal -->
-  <div id="json-modal" class="topo-modal-overlay" style="display:none" tabindex="-1">
-    <div class="topo-modal-inner">
-      <div class="topo-modal-header">
-        <div class="topo-modal-title-row">
-          <h2 class="topo-modal-title">JSON Output</h2>
-          <span class="topo-modal-hint">Read-only — edit the form and regenerate instead</span>
-        </div>
-        <div class="topo-modal-actions">
-          <button id="jsonModalCopy" class="btn btn-outline btn-sm">Copy</button>
-          <button id="jsonModalClose" class="btn btn-ghost btn-sm"
-                  onclick="document.getElementById('json-modal').style.display='none'">✕</button>
-        </div>
-      </div>
-      <pre id="jsonOutputExpanded" class="json-output json-output-expanded"></pre>
-    </div>
-  </div>
+  <!-- Hidden file inputs -->
+  <input type="file" id="anyFileInput" accept=".json,.fasta,.fa,.faa,.txt,.seq,.pdb,.ent,.cif,.mmcif,.csv,.tsv" hidden>
+  <input type="file" id="chainFileInput" accept=".fasta,.fa,.faa,.txt,.seq,.a2m,.pdb,.ent,.cif,.mmcif" hidden>
+  <input type="file" id="csvFileInput" accept=".csv,.txt,.tsv" hidden>
 
-  <!-- XL confirm popup (shown after second residue is selected) -->
-  <div id="xl-confirm-popup" style="display:none" role="dialog" aria-modal="true">
-    <div class="xl-confirm-pair-label" id="xl-confirm-pair-label"></div>
-    <div class="xl-confirm-section">
-      <label class="xl-confirm-radio-row">
-        <input type="radio" name="xlConfirmMode" id="xlModeExisting" value="existing" checked>
-        <span>Add to existing group:</span>
-      </label>
-      <select id="xlConfirmGroupSel" class="xl-confirm-sel"></select>
-    </div>
-    <div class="xl-confirm-section">
-      <label class="xl-confirm-radio-row">
-        <input type="radio" name="xlConfirmMode" id="xlModeNew" value="new">
-        <span>Create new group with:</span>
-      </label>
-      <select id="xlConfirmXlSel" class="xl-confirm-sel"></select>
-    </div>
-    <div class="xl-confirm-footer">
-      <button id="xlConfirmCancelBtn" class="btn btn-ghost btn-sm">Cancel</button>
-      <button id="xlConfirmAddBtn" class="btn btn-primary btn-sm">Add crosslink</button>
-    </div>
+  <!-- Floating bits -->
+  <div id="arc-tooltip"></div>
+  <div id="pickBar" class="pick-bar" hidden role="status" aria-live="polite">
+    <span id="pickBarText"></span>
+    <button id="pickBarCancel">Cancel <kbd>Esc</kbd></button>
   </div>
-
-  <!-- FASTA sequence selection modal -->
-  <div id="fasta-select-modal" style="display:none" role="dialog" aria-modal="true">
-    <div class="fasta-select-box">
-      <div class="fasta-select-header">
-        <span id="fasta-select-title">Select sequences to import</span>
-      </div>
-      <div id="fasta-select-list" class="fasta-select-list"></div>
-      <div class="fasta-select-footer">
-        <button id="fasta-select-cancel" class="btn btn-ghost btn-sm">Cancel</button>
-        <button id="fasta-select-confirm" class="btn btn-primary btn-sm">Import selected</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- XL residue pick banner (fixed, shown for the whole time pick mode is active) -->
-  <div id="xl-pick-banner" role="status" aria-live="polite">
-    <span id="xl-pick-banner-text"></span>
-    <button id="xl-pick-cancel-btn">Stop picking (Esc)</button>
-  </div>
-
-  <!-- Global tooltip for .label-hint "?" icons — escapes overflow:hidden ancestors -->
-  <div id="global-tooltip" class="global-tooltip" role="tooltip"></div>
+  <div id="dropOverlay" class="drop-overlay" hidden><div>Drop a FASTA, PDB / mmCIF, JSON or crosslink CSV file</div></div>
 
   <script type="module" src="js/app.js"></script>
 </body>

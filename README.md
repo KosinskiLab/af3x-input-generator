@@ -1,64 +1,42 @@
 # AF3x Input Generator
 
-A browser-based JSON input generator for [AF3x](https://github.com/KosinskiLab/af3x) — the AlphaFold 3 extension for explicit crosslink modelling.
+A browser tool that builds input JSON files for [AF3x](https://github.com/KosinskiLab/af3x), the AlphaFold 3
+fork that models crosslinks explicitly. Files without crosslinks also run in plain AlphaFold 3.
 
-**Live at https://kosinskilab.github.io/af3x-input-generator/** — no installation needed, just open the link.
+**Live at https://kosinskilab.github.io/af3x-input-generator/**. Nothing to install.
 
-## Features
+## Use
 
-### Sequences
-- **Protein, RNA, DNA, Ligand** entities with full AF3x field support
-- Multiple input modes: type directly, paste FASTA, upload FASTA file, or fetch from **UniProt ID** (live API call)
-- Sequence validation (checks for invalid characters per molecule type)
-- Homomer support via comma-separated chain IDs (e.g. `A,B,C`)
+1. **Chains.** Paste a sequence, FASTA or UniProt ID into a chain, or drop a FASTA / PDB / mmCIF file on the page.
+2. **Crosslinks.** Click two residues, type the pairs (or paste lines like `A 104 B 43`), or import an
+   xiVIEW / xiNET CSV.
+3. **Job.** Name it and press **Download JSON**. The JSON is always up to date; open problems are listed next
+   to the button and block the download until fixed.
 
-### Crosslinks
-- All **AF3x crosslinkers** in a grouped dropdown:
-  - Symmetric NHS-ester: DSSO, DSS, BS3, DSG, BS2G, DSBU, CDI, PHOX, BSPEG5, BSPEG9, azide-A-DSBSO
-  - Asymmetric (order matters!): SDA, SDA25A, LCSDA, SDAD
-  - Dynamic: LINK\<n\> (flexible carbon chain), RIGID\<n\> (rigid aromatic rings)
-- **Warning banner** for asymmetric crosslinkers explaining residue order requirement
-- **CSV import**: upload xiVIEW or xiNET crosslink CSVs → auto-detect format → choose which pairs to import → assign proteins to chain IDs
+Everything else stays off the page until it is used:
 
-### Disulfide Bonds
-- Separate section using the `disulfide_bonds` JSON field
-- AF3x models these by mutating Cys→Ala and adding S–S covalent ligands
+| Feature | Where |
+|---|---|
+| Disulfide bonds, bonded atom pairs, custom ligand definition (CCD) | **Advanced options** (press `/`) |
+| Modifications (PTMs, modified bases) | click a residue, or a chain's `⋯` menu |
+| MSA: none or your own A3M; templates: none or your own structure | a chain's `⋯` menu, or Advanced options |
+| Exact seed values, JSON version | the settings button next to Seeds |
+| Batch export: one job per crosslink, or random crosslink subsets (ZIP) | the arrow next to Download |
+| Open an AlphaFold 3 / AlphaFold Server JSON | **Import**, or drop the file |
 
-### Post-Translational Modifications
-- **PTM picker modal** with 50+ modifications searchable by name or CCD code
-- Categories: Phosphorylation, Acetylation/Methylation, Hydroxylation, D-amino acids, RNA/DNA modifications, and more
-- Works for protein PTMs (`ptmType`/`ptmPosition`) and RNA/DNA base modifications
+The current input is autosaved in the browser and restored on the next visit. **New** clears it.
 
-### Advanced (collapsible)
-- Optional free-text **description** per chain (cosmetic only, not used by AF3x)
-- MSA configuration (unpaired/paired content or file paths)
-- Structural templates (mmCIF content or path + 0-based query/template indices), with
-  automatic index-mapping suggestions via sequence alignment against an uploaded PDB/mmCIF
-- Bonded atom pairs (covalent bonds for glycans, covalent ligands)
-- User-provided CCD (inline mmCIF content or file path)
+## Crosslink CSV
 
-### Output
-- **Generate JSON** — validates all fields, produces AF3x-compatible JSON
-- **Copy to clipboard** / **Download** as `.json`
-- **Import JSON** — load an existing AF3x JSON file to edit
+| Format | Columns read |
+|---|---|
+| xiVIEW | `Protein1`, `Protein2`, `AbsPos1`, `AbsPos2`, `Score`, `Decoy1`, `Decoy2` |
+| xiNET | `Protein1`, `Protein2`, `LinkPos1`, `LinkPos2`, `Score`, optional `PepPos1`, `PepPos2` |
 
-### Topology Visualisation
-- Live **arc diagram** showing all chains as coloured bars and crosslinks as bezier arcs
-- Updates in real time as sequences and crosslinks are added
-- Tooltip on hover shows crosslinker name and residue positions
+Proteins are matched to existing chains by name; the rest get new chains, with sequences fetched from UniProt
+on request. Convert other formats first, for example with [pyXLMS](https://github.com/hgb-bin-proteomics/pyXLMS).
 
-## CSV Import Format
-
-The importer auto-detects two formats from column names:
-
-| Format | Required columns |
-|--------|-----------------|
-| **xiVIEW** | `Protein1`, `Protein2`, `AbsPos1`, `AbsPos2`, `Score` |
-| **xiNET**  | `Protein1`, `Protein2`, `LinkPos1`, `LinkPos2`, `Score` (optional `PepPos1`, `PepPos2`) |
-
-After parsing, you can filter by minimum score, exclude decoys, restrict to inter-protein links, and select individual pairs before importing.
-
-## JSON Format (AF3x)
+## Output
 
 ```json
 {
@@ -79,47 +57,40 @@ After parsing, you can filter by minimum score, exclude decoys, restrict to inte
 }
 ```
 
-## AF3x Quirks & Gotchas
+## AlphaFold 3 rules the tool applies
 
-Things this tool works around or that aren't obvious from AF3x's own docs (verified
-against `folding_input.py`/`pipeline.py`/`templates.py` in the AF3x source):
+- **MSA and templates go together.** A protein with custom templates must also have its MSA set (to a file or
+  to none), and a protein with one custom MSA needs both `unpairedMsa` and `pairedMsa` set. The tool writes the
+  missing one as empty and asks for the MSA choice when templates are custom.
+- **A template is one chain with a release date.** An uploaded PDB or mmCIF is cut down to the chosen chain and
+  rewritten as a minimal mmCIF: `ATOM` records only, first model, residues with coordinates numbered 1…N, release
+  date taken from the file or set to today. Template indices then count the residues that have coordinates,
+  which is what the alignment in the tool produces.
+- **Asymmetric crosslinkers** (SDA, LCSDA, SDAD, SDA25A) need the NHS-ester end first. A pair that is only
+  valid in reverse order is written reversed.
+- **Overlapping crosslinks.** AF3x drops a crosslink whose residue is already used by an earlier one unless it
+  runs with `--noremove_overlapping_crosslinks`; the tool warns about them.
+- **Chain IDs** are upper-case letters. Renaming a chain updates the crosslinks, disulfides and bonds that use it.
+- **`description`** (the chain name) is written only for JSON version 4.
 
-- **Custom templates require explicit MSA.** If a chain has a non-empty `templates`
-  list, AF3x also requires `unpairedMsa`/`pairedMsa` to be explicitly set (either to
-  real MSA content or to `""` to skip search) — leaving MSA on "Auto" while templates
-  are set is rejected with *"…templates set only partially…"*. This tool checks for
-  that combination and blocks JSON generation with a clear error instead of letting
-  AF3x fail later. (`pipeline.py`, `process_protein_chain`)
-- **Templates need real mmCIF, not PDB.** AF3x's `Template.mmcif` field is parsed by
-  a CIF-only parser — there's no PDB code path. Uploading a legacy `.pdb` file for a
-  template is auto-converted to a minimal valid mmCIF (`pdbToMmcif` in
-  `js/pdb_import.js`). Two non-obvious requirements that minimal mmCIF must satisfy,
-  found by trial and error against real AF3x errors:
-  - **No HETATM/waters.** Mixing water into the same `label_entity_id` as the polymer
-    raises *"Bad mmCIF file: non-water entity has water molecules"* — the converter
-    only emits `ATOM` records.
-  - **A release date is mandatory.** Templates without
-    `_pdbx_audit_revision_history.revision_date` raise *"Template structure must have
-    a release date"*. The converter parses the date from a PDB `HEADER` line if
-    present, otherwise falls back to today's date — the exact value doesn't matter
-    for a manually-supplied template.
-- **`userCCDPath` exists** (since AF3x JSON schema v3) — mutually exclusive with
-  `userCCD`. An earlier AF3x version genuinely didn't have it; if you're getting a
-  schema-validation error mentioning it, check which AF3x version/commit you're
-  running against.
-- **Version is fixed at 4** in this tool's output (the current schema version) since
-  it uses `mmcifPath`/`unpairedMsaPath` (v2), `userCCDPath` (v3), and could use
-  `description` (v4). AF3x's `JSON_VERSIONS` accepts 1–4; older AF3x checkouts may
-  cap out lower — re-check `folding_input.py`'s `JSON_VERSIONS` constant if a version
-  mismatch error comes up after an AF3x update.
-- **mmCIF parsing is more varied than it looks.** Real-world CIF files (including
-  AF3x's own outputs) use several valid-but-different conventions this tool's parser
-  (`js/pdb_import.js`) has to handle: a long comment/license header before `data_`
-  (format detection scans further than the first few hundred characters), sequence
-  given via the per-residue `_entity_poly_seq` loop instead of the packed
-  `pdbx_seq_one_letter_code` string, and single-row categories written in flat
-  key-value form instead of a `loop_` block (common for `_entity`/`_entity_poly` in
-  single-chain/single-entity depositions).
+## Development
+
+Static site, no build step. `main` is served by GitHub Pages, so a push goes live.
+
+```bash
+python3 -m http.server 54399 --bind 127.0.0.1   # then open http://127.0.0.1:54399/
+```
+
+| File | Content |
+|---|---|
+| `index.html`, `style.css` | page, dialogs, styles |
+| `js/app.js` | page logic: reads the page into a model, refreshes issues, diagram, sequence views, JSON |
+| `js/af_json.js` | model → issues and JSON; AlphaFold Server JSON conversion |
+| `js/data.js` | crosslinker table (a hand copy of AF3x `crosslink_definitions.py`), modification list, colours |
+| `js/util.js` | FASTA, UniProt, A3M check, alignment |
+| `js/ui.js` | toasts, menus, dialogs |
+| `js/csv_import.js`, `js/pdb_import.js` | crosslink CSV import; PDB / mmCIF parsing and template building |
+| `js/viz.js`, `js/topology_interactive.js` | small and large crosslink diagram |
 
 ## Data sources
 

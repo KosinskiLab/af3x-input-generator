@@ -10,7 +10,7 @@
  *   Escape / ✕         close
  */
 
-import { XL_GROUP_COLORS, XL_DASH_PATTERNS } from './data.js';
+
 
 const NS   = 'http://www.w3.org/2000/svg';
 const ML   = 94;   // left margin  (room for chain labels)
@@ -49,7 +49,7 @@ export function openInteractiveTopology(chains, xlGroups, ssBonds) {
   _maxLen = seqLens.length ? Math.max(...seqLens) : 1;
 
   _resetChainPositions();
-  document.getElementById('topology-modal').style.display = 'flex';
+  document.getElementById('topology-modal').hidden = false;
 
   // Wait for the modal to be laid out before reading dimensions
   requestAnimationFrame(() => {
@@ -97,8 +97,8 @@ function _draw() {
     const t = _el('text');
     _attrs(t, { x: '50%', y: '50%', 'text-anchor': 'middle',
                 'dominant-baseline': 'middle', 'font-size': 16,
-                'font-family': 'sans-serif', fill: '#9aa0a6' });
-    t.textContent = 'Add sequences to see topology';
+                'font-family': 'sans-serif', fill: '#898781' });
+    t.textContent = 'No chains yet';
     svg.appendChild(t);
     return;
   }
@@ -125,11 +125,12 @@ function _draw() {
   // Crosslink arcs — drawn before bars so bars appear on top
   _xlGroups.forEach((grp, gi) => {
     grp.pairs.forEach(pair => {
-      const color = pair.color || grp.color || XL_GROUP_COLORS[gi % XL_GROUP_COLORS.length];
+      const color = pair.color || grp.color || '#888';
       _drawArc(svg, pair, color, grp.name, pair.dashArray || 'none', chainW);
     });
   });
-  _ssBonds.forEach(pair => _drawArc(svg, pair, '#f0b400', 'S–S', '5 3', chainW));
+  const ssColor = getComputedStyle(document.documentElement).getPropertyValue('--ss').trim() || '#888';
+  _ssBonds.forEach(pair => _drawArc(svg, pair, ssColor, 'S–S', '5 3', chainW));
 
   // Chain bars
   _chains.forEach(chain => {
@@ -176,7 +177,7 @@ function _draw() {
     const lbl = _el('text');
     _attrs(lbl, { x: ML - 10, y: y + BAR_H / 2 + 5,
                   'text-anchor': 'end', 'font-size': 14,
-                  'font-family': 'monospace', 'font-weight': 700, fill: color });
+                  'font-family': 'monospace', 'font-weight': 700, fill: 'currentColor' });
     lbl.textContent = (TYPE_PREFIX[chain.type] || '') + (chain.label || chain.id);
     svg.appendChild(lbl);
 
@@ -184,7 +185,7 @@ function _draw() {
     if (chain.length) {
       const hint = _el('text');
       _attrs(hint, { x: ML + cw + 8, y: y + BAR_H / 2 + 5,
-                     'text-anchor': 'start', 'font-size': 10, fill: '#9aa0a6' });
+                     'text-anchor': 'start', 'font-size': 10, fill: '#898781' });
       const unit = (chain.type === 'rna' || chain.type === 'dna') ? 'nt' : 'aa';
       hint.textContent = chain.type === 'ligand' ? 'ligand' : chain.length + ' ' + unit;
       svg.appendChild(hint);
@@ -400,7 +401,7 @@ function _onMouseUp() {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function _close() {
-  document.getElementById('topology-modal').style.display = 'none';
+  document.getElementById('topology-modal').hidden = true;
   _hideTooltip();
 }
 

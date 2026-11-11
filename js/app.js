@@ -1,4235 +1,2047 @@
-/**
- * AF3x Input Generator — main application
- *
- * Manages the form state, sequence cards, crosslink groups, disulfide bonds,
- * PTM picker, JSON generation, JSON import, and coordinates the arc diagram.
- */
+// AF3x Input Generator — page logic.
+//
+// The page is the state. collect() reads it into a model (see af_json.js);
+// refresh() validates the model, marks problems, redraws the diagram and the
+// sequence views, rebuilds the JSON and autosaves it.
 
-import { CROSSLINKERS, PTM_DATABASE, PTM_CATEGORIES, chainColorForType, XL_GROUP_COLORS, MOD_GROUP_COLORS, XL_DASH_PATTERNS } from './data.js';
+import { CROSSLINKERS, PTM_DATABASE, XL_GROUP_COLORS, XL_DASH_PATTERNS } from './data.js';
 import { drawArcDiagram } from './viz.js';
-import { openImportModal, initImportModal, _shortProteinName } from './csv_import.js';
-import { openPdbModal, initPdbModal, extractAtomSequences, isMmcifText, pdbToMmcif } from './pdb_import.js';
-import { updateXlStats } from './xl_stats.js';
-import { openInteractiveTopology, initInteractiveTopology, resetTopologyView } from './topology_interactive.js';
+import { openImportModal, initImportModal, shortProteinName } from './csv_import.js';
+import { openPdbModal, initPdbModal, extractAtomSequences, buildTemplate } from './pdb_import.js';
+import { openInteractiveTopology, initInteractiveTopology } from './topology_interactive.js';
+import {
+  esc, readFileText, plural, cleanSeq, ALPHABET, parseFasta, shortHeader, guessSeqType, parseUniprotIds, fetchUniprot,
+  sniffFile, validateA3m, needlemanWunsch, alignmentToMapping, parseIntList, formatRanges, parseRanges,
+} from './util.js';
+import { findXl, checkPair, validate, toJson, detectJsonDialect, convertServerJson } from './af_json.js';
+import { toast, openMenu, openPopover, closePopover, showModal, hideModal, initModals, anyModalOpen } from './ui.js';
 
-// ─── State ────────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
 
-let _seqCounter = 0;   // unique id for each sequence entity
-let _xlCounter  = 0;   // unique id for each crosslink group
-let _ssCounter  = 0;   // unique id for each disulfide bond
-let _bondCounter = 0;  // unique id for each bonded atom pair
+const LS_STATE = 'af3x_autosave';
+const LS_THEME = 'af3x_theme';
+const LS_JSON_OPEN = 'af3x_json_open';
+const TYPE_LABEL = { protein: 'Protein', rna: 'RNA', dna: 'DNA', ligand: 'Ligand' };
+const UNIT = { protein: 'aa', rna: 'nt', dna: 'nt' };
+const SEQ_PLACEHOLDER = {
+  protein: 'Paste sequence, FASTA or UniProt ID',
+  rna: 'Paste RNA sequence or FASTA',
+  dna: 'Paste DNA sequence or FASTA',
+};
 
-// active PTM picker context
-let _ptmContext = null;  // { seqId, modIdx }
+let uid = 0;
+let pending = null;    // residue action in progress: { kind: 'xl'|'ss'|'mod', card, pos, ccd, target }
+let activeXl = null;   // crosslinker group that receives clicked pairs
+let seedMode = 'count';
+let version = 4;
+let current = { model: null, issues: [], json: null };
+let nagged = false;    // Download was pressed while blocked: empty required fields are marked too
 
-// XL residue pick state (click-to-add-XL in sequence display)
-let _xlPickMode  = false; // true when "Select XL residues" button is active
-let _xlPickState = null;  // null | { chainId, pos, spanEl }
-let _xlPendingPair = null; // null | { c1, p1, c2, p2 } — waiting for popup confirmation
+const ICON = {
+  edit: '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.5 2.5l2 2L5 13l-2.7.7L3 11z"/></svg>',
+  more: '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/></svg>',
+  grip: '<svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor" aria-hidden="true"><circle cx="2.5" cy="2.5" r="1.2"/><circle cx="7.5" cy="2.5" r="1.2"/><circle cx="2.5" cy="7" r="1.2"/><circle cx="7.5" cy="7" r="1.2"/><circle cx="2.5" cy="11.5" r="1.2"/><circle cx="7.5" cy="11.5" r="1.2"/></svg>',
+};
 
-// Modification residue pick state
-let _modPickState = null; // null | { seqId, row, targetAA }
+// ─── Refresh loop ────────────────────────────────────────────────────────────
 
-// Disulfide bond residue pick state
-let _ssPickState = null; // null | { row, slot: 'a'|'b' }
+let _dirty = false;
 
-// XL pair row residue pick state (per-row pick button)
-let _xlRowPickState = null; // null | { row, slot: 'a'|'b' }
-
-// ─── Initialisation ───────────────────────────────────────────────────────────
-
-document.addEventListener('DOMContentLoaded', () => {
-  _initCrosslinkPresets();
-  _initPTMModal();
-  _initJsonImport();
-  initImportModal();
-  initPdbModal();
-  try { initInteractiveTopology(); } catch (e) { console.warn('topology init:', e); }
-  window._resetTopologyView = resetTopologyView;
-
-  // Add-entity buttons
-  document.querySelectorAll('.btn-add-entity').forEach(btn => {
-    btn.addEventListener('click', () => addSequenceCard(btn.dataset.seqtype));
-  });
-
-  // Crosslinks section
-  document.getElementById('addCrosslinkGroupBtn').addEventListener('click', addCrosslinkGroup);
-  document.getElementById('crosslinkerPresetsBtn').addEventListener('click', _togglePresetsDropdown);
-
-  // Disulfide bonds
-  document.getElementById('addSsBondBtn').addEventListener('click', addSsBond);
-
-  // Bonded atom pairs
-  document.getElementById('addBondBtn').addEventListener('click', addBond);
-
-  // Generate + copy + download
-  document.getElementById('generateBtn').addEventListener('click', generateJSON);
-  document.getElementById('copyJsonBtn').addEventListener('click', _copyJSON);
-  document.getElementById('expandJsonBtn').addEventListener('click', () => {
-    document.getElementById('jsonOutputExpanded').textContent = document.getElementById('jsonOutput').textContent;
-    document.getElementById('json-modal').style.display = 'flex';
-  });
-  document.getElementById('jsonModalCopy').addEventListener('click', _copyJSON);
-
-  // Batch export
-  document.getElementById('batchSingleBtn').addEventListener('click', _batchSingleXL);
-  document.getElementById('batchComboBtn').addEventListener('click', _batchRandomCombos);
-  document.getElementById('batchComboK').addEventListener('input', _updateBatchInfo);
-  document.getElementById('batchComboM').addEventListener('input', _updateBatchInfo);
-  document.getElementById('batchPanel').addEventListener('toggle', _updateBatchInfo);
-
-  // Reset button
-  document.getElementById('resetBtn').addEventListener('click', resetAll);
-
-  // Theme toggle
-  _initThemeToggle();
-
-  // Intro / overview banner
-  _initIntroBanner();
-
-  // User CCD: content vs path are mutually exclusive
-  _initUserCcdExclusivity();
-
-  // Global tooltips for .label-hint "?" icons (event delegation — covers dynamically added ones)
-  _initLabelHints();
-
-
-  // JSON import button
-  document.getElementById('importBtn').addEventListener('click', () => {
-    document.getElementById('importFileInput').click();
-  });
-  document.getElementById('importFileInput').addEventListener('change', _handleJsonImport);
-
-  // CSV import button (from crosslinks section)
-  document.getElementById('importCsvBtn').addEventListener('click', () => {
-    document.getElementById('csvFileInput').click();
-  });
-  document.getElementById('csvFileInput').addEventListener('change', _handleCsvFile);
-
-  // Expand interactive topology
-  document.getElementById('expandTopologyBtn').addEventListener('click', () => {
-    const chains   = _readChainsFromDOM();
-    const xlGroups = _readXlGroupsFromDOM();
-    const ssBonds  = _readSsBondsFromDOM();
-    openInteractiveTopology(chains, xlGroups, ssBonds);
-  });
-
-  // Import from ▾ dropdown
-  const importFromBtn  = document.getElementById('importFromBtn');
-  const importDropdown = document.getElementById('import-dropdown');
-  importFromBtn?.addEventListener('click', e => {
-    e.stopPropagation();
-    const open = importDropdown.style.display !== 'none';
-    importDropdown.style.display = open ? 'none' : 'block';
-  });
-  document.addEventListener('click', () => { if (importDropdown) importDropdown.style.display = 'none'; });
-
-  document.getElementById('importPdbBtn').addEventListener('click', () => {
-    importDropdown.style.display = 'none';
-    document.getElementById('pdbFileInput').click();
-  });
-  document.getElementById('importFastaBtn').addEventListener('click', () => {
-    importDropdown.style.display = 'none';
-    document.getElementById('fasta-import-file-input').click();
-  });
-  document.getElementById('importUniprotBtn').addEventListener('click', () => {
-    importDropdown.style.display = 'none';
-    _openUniprotModal();
-  });
-
-  document.getElementById('pdbFileInput').addEventListener('change', _handlePdbFile);
-
-  // "Select XL residues" toggle button
-  document.getElementById('selectXlBtn')?.addEventListener('click', _toggleXlPickMode);
-
-  // XL pick: ESC cancels everything, banner cancel button
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') {
-      if (_modPickState)     { _exitModPickMode();    return; }
-      if (_ssPickState)      { _exitSsPickMode();     return; }
-      if (_xlRowPickState)   { _exitXlRowPickMode();  return; }
-      if (_xlPendingPair)    { _closePendingPair();   return; }
-      if (_xlPickState)      { _clearPickState();     return; }
-      if (_xlPickMode)       { _toggleXlPickMode(); }
-    }
-  });
-  document.getElementById('xl-pick-cancel-btn')?.addEventListener('click', () => {
-    _clearPickState();
-    if (_xlRowPickState) _exitXlRowPickMode();
-    if (_xlPickMode) _toggleXlPickMode();
-  });
-
-  // XL confirm popup buttons
-  document.getElementById('xlConfirmCancelBtn')?.addEventListener('click', _closePendingPair);
-  document.getElementById('xlConfirmAddBtn')?.addEventListener('click', _commitXlFromPopup);
-
-  // Enable/disable group select based on radio
-  document.querySelectorAll('input[name="xlConfirmMode"]').forEach(radio => {
-    radio.addEventListener('change', () => {
-      const existing = document.getElementById('xlModeExisting').checked;
-      document.getElementById('xlConfirmGroupSel').disabled = !existing;
-      document.getElementById('xlConfirmXlSel').disabled    = existing;
-    });
-  });
-
-  // Seed mode toggle
-  document.querySelectorAll('.seed-seg-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.seed-seg-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      const isCount = btn.dataset.mode === 'count';
-      document.getElementById('seedCount').style.display    = isCount ? '' : 'none';
-      document.getElementById('seedSpecific').style.display = isCount ? 'none' : '';
-    });
-  });
-
-  // Global FASTA import
-  _initGlobalFastaImport();
-
-  // Sequence card reordering
-  _initSeqReorder();
-
-  // UniProt import modal
-  _initUniprotModal();
-
-  // AlphaFold Server import modal
-  _initServerImportModal();
-
-  // localStorage restore banner
-  _checkRestoreSession();
-
-  // Close dropdown on outside click
-  document.addEventListener('click', e => {
-    const dd = document.getElementById('presets-dropdown');
-    if (!dd.contains(e.target) && e.target.id !== 'crosslinkerPresetsBtn') {
-      dd.style.display = 'none';
-    }
-  });
-
-  // Start with one protein sequence
-  addSequenceCard('protein');
-
-  // Expose internals for automated testing (harmless in production)
-  window._testApi = { populateFromJSON: _populateFromJSON };
-
-  // Re-render sequence displays when window is resized
-  let _resizeTimer = null;
-  window.addEventListener('resize', () => {
-    clearTimeout(_resizeTimer);
-    _resizeTimer = setTimeout(() => {
-      document.querySelectorAll('.seq-card').forEach(card => {
-        const display = card.querySelector('.seq-display');
-        if (display && display.style.display !== 'none') _updateRuler(card);
-      });
-    }, 150);
-  });
-
-  // Tab switching
-  document.querySelectorAll('.app-tab').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.app-tab').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      const tab = btn.dataset.tab;
-      document.querySelector('.main-layout').style.display  = tab === 'build' ? '' : 'none';
-      document.getElementById('about-panel').style.display  = tab === 'about' ? '' : 'none';
-    });
-  });
-
-  // Build about crosslinker table
-  _buildAboutXlTable();
-});
-
-function _buildAboutXlTable() {
-  const wrap = document.getElementById('about-xl-table-wrap');
-  if (!wrap) return;
-  const rows = CROSSLINKERS.map(xl => {
-    const reactText = xl.dynamic ? '—'
-      : xl.symmetric
-        ? (xl.reactiveResidues || []).join(', ')
-        : `<span style="color:var(--text-2)">End 1:</span> ${xl.reactiveResidues[0].join(', ')}<br><span style="color:var(--text-2)">End 2:</span> ${xl.reactiveResidues[1].join(', ')}`;
-    const badge = xl.dynamic
-      ? `<span class="xl-ref-dyn">dynamic</span>`
-      : xl.symmetric
-        ? `<span class="xl-ref-sym">symmetric</span>`
-        : `<span class="xl-ref-asym">asymmetric</span>`;
-    return `<tr>
-      <td class="xl-ref-name">${xl.name}</td>
-      <td>${xl.category}</td>
-      <td class="xl-ref-spacer">${xl.spacer || '—'}</td>
-      <td>${reactText}</td>
-      <td>${badge}</td>
-      <td>${xl.description || ''}</td>
-    </tr>`;
-  }).join('');
-  wrap.innerHTML = `
-    <table class="xl-ref-table">
-      <thead><tr>
-        <th>Name</th><th>Category</th><th>Spacer</th><th>Reactive residues</th><th>Type</th><th>Description</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+/** Schedule one refresh for the next frame. */
+function touch() {
+  if (_dirty) return;
+  _dirty = true;
+  requestAnimationFrame(refresh);
 }
 
-// ─── Sequence Cards ───────────────────────────────────────────────────────────
+function refresh() {
+  _dirty = false;
+  const model = collect();
+  const issues = validate(model);
+  const json = toJson(model);
+  current = { model, issues, json };
+  annotate(model, issues);
+  renderIssues(issues);
+  renderJson();
+  renderSeqViews(model);
+  drawDiagram(model);
+  syncSections(model);
+  scheduleSave();
+}
 
-// Per-type counters so chains of the same type cycle through that type's own
-// colour family (see chainColorForType in data.js) instead of a single global rotation.
-const _typeColorCounters = { protein: 0, rna: 0, dna: 0, ligand: 0 };
+// ─── Chains ──────────────────────────────────────────────────────────────────
 
-export function addSequenceCard(type) {
-  _seqCounter++;
-  const id = `seq_${_seqCounter}`;
+const CHAIN_HTML = `
+  <div class="chain-head">
+    <span class="grip" title="Drag to reorder">${ICON.grip}</span>
+    <input class="chain-id" maxlength="4" spellcheck="false" autocomplete="off" aria-label="Chain ID" title="Chain ID">
+    <button class="chain-type" title="Change type"></button>
+    <input class="chain-label" placeholder="name" spellcheck="false" autocomplete="off" aria-label="Chain name" title="Name (optional)">
+    <span class="chain-len"></span>
+    <span class="chain-tools">
+      <button class="icon-btn chain-edit" title="Edit sequence" aria-label="Edit sequence">${ICON.edit}</button>
+      <button class="icon-btn chain-more" title="Modifications, MSA, templates, duplicate" aria-label="Chain options" aria-haspopup="menu">${ICON.more}</button>
+      <button class="icon-btn chain-del" title="Remove chain" aria-label="Remove chain">×</button>
+    </span>
+  </div>
+  <div class="chain-body">
+    <div class="seq-wrap">
+      <pre class="seq-view" hidden></pre>
+      <textarea class="seq-edit" rows="2" spellcheck="false" autocomplete="off"></textarea>
+    </div>
+    <div class="seq-msg" hidden></div>
+    <div class="lig-row" hidden>
+      <div class="seg lig-kind"><button data-v="ccd" class="on">CCD</button><button data-v="smiles">SMILES</button></div>
+      <input class="lig-input" spellcheck="false" autocomplete="off">
+    </div>
+  </div>
+  <div class="chain-opts">
+    <div class="opt opt-mods" hidden>
+      <span class="opt-name">Modifications</span>
+      <span class="chips"></span>
+      <button class="chip chip-add" title="Add modification" aria-label="Add modification">+</button>
+    </div>
+    <div class="opt opt-msa" hidden>
+      <span class="opt-name">MSA</span>
+      <div class="seg" data-seg="msa"><button data-v="auto" title="AF3 searches the databases">Auto</button><button data-v="none" title="Run without an MSA">None</button><button data-v="custom" title="Use your own A3M">Custom</button></div>
+      <button class="icon-btn opt-x" title="Back to automatic" aria-label="Back to automatic">×</button>
+      <div class="opt-body" data-body="msa" hidden>
+        <div class="file-row" data-slot="unpaired">
+          <span class="file-name">Unpaired</span>
+          <input class="msa-path" placeholder="path to .a3m on the machine that runs AF3x" spellcheck="false">
+          <label class="btn sm" title="Store the file in the JSON">Upload<input type="file" accept=".a3m,.txt,.fasta" hidden></label>
+        </div>
+        <div class="file-row" data-slot="paired">
+          <span class="file-name">Paired</span>
+          <input class="msa-path" placeholder="optional" spellcheck="false">
+          <label class="btn sm" title="Store the file in the JSON">Upload<input type="file" accept=".a3m,.txt,.fasta" hidden></label>
+        </div>
+        <div class="opt-msg" hidden></div>
+      </div>
+    </div>
+    <div class="opt opt-tpl" hidden>
+      <span class="opt-name">Templates</span>
+      <div class="seg" data-seg="tpl"><button data-v="auto" title="AF3 searches the PDB">Auto</button><button data-v="none" title="Run without templates">None</button><button data-v="custom" title="Use your own structures">Custom</button></div>
+      <button class="icon-btn opt-x" title="Back to automatic" aria-label="Back to automatic">×</button>
+      <div class="opt-body" data-body="tpl" hidden>
+        <div class="tpl-list"></div>
+        <button class="btn add sm add-tpl">+ Template</button>
+      </div>
+    </div>
+  </div>`;
 
-  const typeIdx = _typeColorCounters[type] ?? 0;
-  _typeColorCounters[type] = typeIdx + 1;
-  const color = chainColorForType(type, typeIdx);
+const chainCards = () => [...$('chains').querySelectorAll('.chain')];
+const cardId = card => card.querySelector('.chain-id').value.trim();
+const cardByChainId = id => chainCards().find(c => cardId(c) === id) || null;
 
+function intToId(i) {
+  let s = '';
+  for (i += 1; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + ((i - 1) % 26)) + s;
+  return s;
+}
+
+function nextChainId() {
+  const used = new Set(chainCards().map(cardId));
+  for (let i = 0; ; i++) if (!used.has(intToId(i))) return intToId(i);
+}
+
+/**
+ * Add a chain card. d: { id, label, sequence, ccd, smiles }.
+ * opts: { after: card, guess: true to detect RNA/DNA from the sequence }.
+ */
+function addChain(type, d = {}, opts = {}) {
   const card = document.createElement('div');
-  card.className  = 'seq-card';
-  card.dataset.id = id;
-  card.dataset.color = color;
+  card.className = 'chain';
+  card.dataset.uid = `c${++uid}`;
+  card.innerHTML = CHAIN_HTML;
+  card._seq = '';
+  card._guess = !!opts.guess;
+  const id = d.id || nextChainId();
+  card.querySelector('.chain-id').value = id;
+  card._id = id;
+  if (opts.after?.isConnected) opts.after.after(card);
+  else $('chains').appendChild(card);
+  setType(card, type);
+  if (d.label) card.querySelector('.chain-label').value = d.label;
+  if (type === 'ligand') {
+    if (d.smiles) { setLigKind(card, 'smiles'); card.querySelector('.lig-input').value = d.smiles; }
+    else if (d.ccd) card.querySelector('.lig-input').value = [].concat(d.ccd).join(', ');
+  } else if (d.sequence) {
+    setSeq(card, d.sequence);
+  }
+  refreshChainSels();
+  touch();
+  return card;
+}
+
+function setType(card, type) {
   card.dataset.type = type;
-  card.style.setProperty('--chain-color', color);
-
-  card.innerHTML = `
-    <div class="seq-card-main">
-
-      <div class="seq-left">
-        <span class="drag-handle" title="Drag to reorder">⠿</span>
-        <span class="seq-type-badge" style="background:${color}">${_typeLabel(type)}</span>
-        <span class="seq-type-label">${_typeLabel(type)}</span>
-        <div class="seq-chain-id-wrap">
-          <label>Chain ID</label>
-          <input type="text" class="seq-chain-id" placeholder="A" value="${_nextChainId()}"
-                 autocomplete="off" spellcheck="false" data-seqid="${id}" maxlength="4">
-          <span class="chain-id-dup-warn" style="display:none" title="Duplicate chain ID">⚠</span>
-          <span class="chain-id-multi-warn" style="display:none" title="Use separate cards for multiple chains">One ID only</span>
-        </div>
-        <span class="seq-length-hint"></span>
-        <button class="btn-copy-chain" data-seqid="${id}" title="Duplicate chain (new chain ID, no crosslinks)">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <rect x="5" y="5" width="9" height="9" rx="1.5" stroke="currentColor" stroke-width="1.6"/>
-            <path d="M3 11H2.5A1.5 1.5 0 0 1 1 9.5v-7A1.5 1.5 0 0 1 2.5 1h7A1.5 1.5 0 0 1 11 2.5V3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-          </svg>
-          Duplicate
-        </button>
-      </div>
-
-      <div class="seq-right">
-        ${_sequenceInputBlock(type, id)}
-      </div>
-
-      <div class="seq-actions">
-        <button class="btn-icon btn-remove-seq" data-seqid="${id}" title="Remove">✕</button>
-      </div>
-
-    </div>
-
-    <details class="seq-advanced">
-      <summary>Advanced options <span class="seq-advanced-sub" data-seqid="${id}">${_advancedSubLabel(type)}</span></summary>
-      ${_advancedBlock(type, id)}
-    </details>
-  `;
-
-  // Wire input mode tabs and interactive elements
-  _wireSeqInputTabs(card, type, id);
-
-  // Drag-to-reorder: only activate when mousedown on the handle
-  const handle = card.querySelector('.drag-handle');
-  if (handle) {
-    handle.addEventListener('mousedown', () => { card.draggable = true; });
-    card.addEventListener('dragend', () => { card.draggable = false; });
+  const lig = type === 'ligand';
+  const typeBtn = card.querySelector('.chain-type');
+  typeBtn.textContent = TYPE_LABEL[type];
+  typeBtn.disabled = lig;
+  card.querySelector('.seq-wrap').hidden = lig;
+  card.querySelector('.lig-row').hidden = !lig;
+  card.querySelector('.chain-edit').hidden = lig;
+  if (lig) {
+    setLigKind(card, card.dataset.lig || 'ccd');
+    card.querySelector('.chips').innerHTML = '';
+    card.querySelector('.opt-mods').hidden = true;
+  } else {
+    card.querySelector('.seq-edit').placeholder = SEQ_PLACEHOLDER[type];
   }
+  if (lig || type === 'dna') setMode(card, 'msa', 'auto');
+  if (type !== 'protein') setMode(card, 'tpl', 'auto');
+  card.querySelector('.file-row[data-slot="paired"]').hidden = type !== 'protein';
+  card._sig = null;
+}
 
-  card.querySelector('.btn-copy-chain').addEventListener('click', () => {
-    const seq = card.querySelector('.seq-textarea')?.value || '';
-    addSequenceCard(type);
-    // The new card is the last one — fill in the sequence / ligand data
-    const all  = document.querySelectorAll('#sequences-container .seq-card');
-    const copy = all[all.length - 1];
-    if (!copy) return;
-    if (type === 'ligand') {
-      // Copy whichever ligand input tab is active
-      const activePanel = card.querySelector('.ligand-body .tab-panel.active');
-      const panelKey    = activePanel?.dataset.panel || 'ccd';
-      const srcVal      = activePanel?.querySelector('input')?.value || '';
-      if (srcVal) {
-        // Switch copy card to the same tab first
-        const copyTabBtn = copy.querySelector(`.tab-btn[data-tab="${panelKey}"]`);
-        if (copyTabBtn) copyTabBtn.click();
-        const destInput = copy.querySelector(`.ligand-body .tab-panel[data-panel="${panelKey}"] input`);
-        if (destInput) {
-          destInput.value = srcVal;
-          destInput.dispatchEvent(new Event('input'));
-        }
-      }
-    } else {
-      const ta = copy.querySelector('.seq-textarea');
-      if (ta && seq) {
-        ta.value = seq;
-        _autoValidateSeq(ta, type);
-        _updateRuler(copy);
-      }
+function setLigKind(card, kind) {
+  card.dataset.lig = kind;
+  card.querySelectorAll('.lig-kind button').forEach(b => b.classList.toggle('on', b.dataset.v === kind));
+  card.querySelector('.lig-input').placeholder = kind === 'smiles' ? 'CC(=O)Oc1ccccc1C(=O)O' : 'ATP';
+}
+
+function removeChain(card) {
+  if (pending?.card === card) clearPending();
+  card.remove();
+  refreshChainSels();
+  touch();
+}
+
+function duplicateChain(card) {
+  const c = collect().chains.find(x => x.el === card);
+  const entry = toJson({ ...emptyModel(), version: 4, chains: [c] }).sequences[0];
+  addChainFromEntry(entry, { newId: true, after: card });
+}
+
+// ── Sequence text ────────────────────────────────────────────────────────────
+
+function setSeq(card, seq) {
+  card._seq = cleanSeq(seq);
+  card.querySelector('.seq-edit').value = card._seq;
+  showSeqView(card);
+}
+
+function showSeqView(card) {
+  const has = !!card._seq;
+  card.querySelector('.seq-view').hidden = !has;
+  card.querySelector('.seq-edit').hidden = has;
+  card.querySelector('.seq-msg').hidden = true;
+  card._sig = null;
+}
+
+function autoGrow(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = `${Math.min(ta.scrollHeight + 2, 240)}px`;
+}
+
+function editSeq(card, pos = null) {
+  clearPending();
+  hideTip();
+  const ta = card.querySelector('.seq-edit');
+  card.querySelector('.seq-view').hidden = true;
+  ta.hidden = false;
+  autoGrow(ta);
+  ta.focus();
+  const at = pos ?? ta.value.length;
+  ta.setSelectionRange(at, at);
+}
+
+function onSeqInput(card, ta) {
+  const raw = ta.value;
+  const msg = card.querySelector('.seq-msg');
+  const ids = card.dataset.type === 'protein' ? parseUniprotIds(raw) : null;
+  if (ids) {
+    card._seq = '';
+    msg.hidden = false;
+    msg.innerHTML = `<button class="btn sm primary fetch-btn">Fetch ${esc(ids.join(', '))} from UniProt</button>`;
+  } else {
+    msg.hidden = true;
+    card._seq = /^\s*[>;]/.test(raw) ? (parseFasta(raw)[0]?.seq || '') : cleanSeq(raw);
+  }
+  autoGrow(ta);
+}
+
+/** Turn the text box content into a sequence: UniProt IDs are fetched, FASTA is split into chains. */
+function commitSeq(card) {
+  const ta = card.querySelector('.seq-edit');
+  if (ta.hidden || !card.isConnected) return;
+  const raw = ta.value.trim();
+  if (!raw) { card._seq = ''; touch(); return; }
+  if (card.dataset.type === 'protein') {
+    const ids = parseUniprotIds(raw);
+    if (ids) { fetchInto(card, ids); return; }
+  }
+  if (/^\s*[>;]/m.test(raw)) {
+    const entries = parseFasta(raw);
+    if (!entries.length) return;
+    let last = card;
+    entries.forEach((e, i) => {
+      const target = i === 0 ? card : addChain('protein', {}, { after: last, guess: true });
+      fillChain(target, e.seq, shortHeader(e.header));
+      last = target;
+    });
+    touch();
+    return;
+  }
+  fillChain(card, raw, '');
+  touch();
+}
+
+function fillChain(card, seq, label) {
+  seq = cleanSeq(seq);
+  if (card._guess && card.dataset.type !== 'ligand') {
+    const t = guessSeqType(seq);
+    if (t !== card.dataset.type) setType(card, t);
+  }
+  setSeq(card, seq);
+  const lab = card.querySelector('.chain-label');
+  if (label && !lab.value) lab.value = label;
+}
+
+async function fetchInto(card, ids) {
+  if (card._fetching) return;
+  card._fetching = true;
+  const msg = card.querySelector('.seq-msg');
+  msg.hidden = false;
+  msg.textContent = 'Fetching…';
+  const results = await Promise.allSettled(ids.map(fetchUniprot));
+  card._fetching = false;
+  if (!card.isConnected) return;
+  let last = null;
+  for (const r of results) {
+    if (r.status !== 'fulfilled') {
+      toast(r.reason instanceof TypeError ? 'UniProt could not be reached' : r.reason.message, { type: 'error' });
+      continue;
     }
-  });
-
-  card.querySelector('.btn-remove-seq').addEventListener('click', () => {
-    card.remove();
-    _updateSeqCount();
-    updateViz();
-  });
-
-  card.querySelector('.seq-chain-id').addEventListener('input', function() {
-    const warn = card.querySelector('.chain-id-multi-warn');
-    if (this.value.includes(',') || this.value.includes(' ')) {
-      this.value = this.value.replace(/[,\s]+/g, '');
-      if (warn) { warn.style.display = ''; setTimeout(() => { warn.style.display = 'none'; }, 2000); }
-    }
-    updateViz();
-  });
-
-  document.getElementById('sequences-container').appendChild(card);
-  _updateSeqCount();
-  updateViz();
-  _updateAdvancedSummary(id);
-}
-
-function _typeLabel(type) {
-  return { protein: 'Protein', rna: 'RNA', dna: 'DNA', ligand: 'Ligand' }[type] || type;
-}
-
-function _nextChainId() {
-  const used = new Set();
-  document.querySelectorAll('.seq-chain-id').forEach(el => {
-    el.value.split(',').map(s => s.trim()).forEach(c => used.add(c));
-  });
-  for (let i = 0; i < 26; i++) {
-    const c = String.fromCharCode(65 + i);
-    if (!used.has(c)) return c;
+    const target = last ? addChain('protein', {}, { after: last }) : card;
+    setSeq(target, r.value.seq);
+    const lab = target.querySelector('.chain-label');
+    if (!lab.value) lab.value = r.value.name;
+    last = target;
   }
-  return 'A';
+  msg.hidden = true;
+  msg.textContent = '';
+  touch();
 }
 
-function _updateSeqCount() {
-  const n = document.querySelectorAll('.seq-card').length;
-  document.getElementById('seqCountBadge').textContent = n;
-
-  const hasLigand = !!document.querySelector('.seq-card[data-type="ligand"]');
-  const ccdSection = document.getElementById('userCcdSection');
-  if (ccdSection) ccdSection.style.display = hasLigand ? '' : 'none';
-}
-
-function _sequenceInputBlock(type, id) {
-  if (type === 'ligand') {
-    return `
-      <div class="seq-body ligand-body">
-        <div class="input-tabs">
-          <button class="tab-btn active" data-tab="ccd">CCD Codes</button>
-          <button class="tab-btn" data-tab="smiles">SMILES</button>
-        </div>
-        <div class="tab-panel active" data-panel="ccd">
-          <input type="text" class="ligand-ccd seq-validated" placeholder="e.g. ATP or ATP,ADP"
-                 data-seqid="${id}" autocomplete="off">
-          <span class="seq-hint">Comma-separated CCD codes from the wwPDB Chemical Component Dictionary</span>
-        </div>
-        <div class="tab-panel" data-panel="smiles" style="display:none">
-          <input type="text" class="ligand-smiles seq-validated"
-                 placeholder="e.g. CC(=O)Oc1ccccc1C(=O)O" data-seqid="${id}" autocomplete="off">
-          <span class="seq-hint">SMILES string (cannot define covalent bonds with SMILES)</span>
-        </div>
-      </div>`;
+/** Add FASTA entries as chains; an untouched empty chain is reused first. */
+function addSeqEntries(entries) {
+  for (const e of entries) {
+    const spare = chainCards().find(c => c.dataset.type !== 'ligand' && !c._seq &&
+      !c.querySelector('.seq-edit').value.trim() && !c.querySelector('.chain-label').value);
+    const card = spare || addChain('protein', {}, { guess: true });
+    card._guess = true;
+    fillChain(card, e.seq, shortHeader(e.header));
   }
-
-  const placeholder = type === 'protein'
-    ? 'MKVLWAALLVTFLAGCQAKVEQAVEDANSQATRVCEKMFEASYSRVEDVYASPKLQNLFKDPQYILINTTESYTLDADMKIAQEKKTSFQKLTENFQKLENFMLNKFKKNLKDTFEALKNVSKLKL'
-    : type === 'rna' ? 'AGCUAGCUAGCU' : 'ACGTACGTACGT';
-
-  return `
-    <div class="seq-body">
-      <div class="tab-panel active" data-panel="text">
-        <div class="seq-editor-wrap">
-          <pre class="seq-display" title="Click to edit"></pre>
-          <textarea class="seq-textarea seq-validated"
-                    placeholder="${placeholder}"
-                    data-seqid="${id}" spellcheck="false"></textarea>
-        </div>
-        <div class="seq-meta"><span class="seq-val-msg"></span></div>
-      </div>
-    </div>`;
+  touch();
 }
 
-function _advancedSubLabel(type) {
-  if (type === 'ligand') return '';
-  if (type === 'dna')    return '— Mods: 0';
-  if (type === 'rna')    return '— Mods: 0 · MSA: Auto';
-  return '— Mods: 0 · MSA: Auto · Templates: 0';
+// ── Sequence view ────────────────────────────────────────────────────────────
+
+let _charW = 0;
+
+function measureChar() {
+  const probe = document.createElement('pre');
+  probe.className = 'seq-view';
+  probe.style.cssText = 'position:absolute;visibility:hidden;width:auto;padding:0;border:0;max-height:none';
+  probe.textContent = 'M'.repeat(40);
+  document.body.appendChild(probe);
+  _charW = probe.getBoundingClientRect().width / 40 || 8;
+  probe.remove();
 }
 
-const _MSA_MODE_LABELS = { auto: 'Auto', custom: 'Custom', none: 'None' };
-
-/** Returns 'none' | 'custom' | 'auto' for a chain's MSA, derived from actual
- *  field state (within the given seq-card) rather than a UI mode toggle. */
-function _getMsaMode(card) {
-  if (card.querySelector('.no-msa-check')?.checked) return 'none';
-  const hasValue = sel => [...card.querySelectorAll(sel)].some(el => el.value.trim());
-  const hasCustom =
-    hasValue('.msa-unpaired-path, .msa-unpaired-content') ||
-    hasValue('.msa-paired-path, .msa-paired-content');
-  return hasCustom ? 'custom' : 'auto';
+function lineLength(card) {
+  if (!_charW) measureChar();
+  const w = card.querySelector('.seq-wrap').clientWidth - 40;
+  const chars = Math.floor(w / _charW);
+  return Math.max(1, Math.floor((chars - 6) / 11)) * 10;
 }
 
-/** Updates the live "— Mods: N · MSA: X · Templates: N" summary shown next to
- *  "Advanced options" so users can see what's configured without expanding it. */
-function _updateAdvancedSummary(seqId) {
-  const card  = document.querySelector(`.seq-card[data-id="${seqId}"]`);
-  const subEl = card?.querySelector('.seq-advanced-sub');
-  if (!subEl) return;
+/** hl: Map(pos → { cls: [..], color, tips: [..], pids: [..] }) */
+function renderSeq(card, hl) {
+  const view = card.querySelector('.seq-view');
+  if (view.hidden) return;
+  const seq = card._seq;
+  const perLine = lineLength(card);
+  let hlSig = '';
+  hl.forEach((h, p) => { hlSig += `${p}${h.cls.join('')}${h.color || ''}${h.pids.join('.')};`; });
+  const sig = `${seq}|${perLine}|${hlSig}`;
+  if (card._sig === sig) return;
+  card._sig = sig;
+  card._tips = new Map();
 
-  const parts = [];
-
-  const modsCount = card.querySelectorAll(`.mods-container[data-seqid="${seqId}"] .mod-row`).length;
-  parts.push(`Mods: ${modsCount}`);
-
-  if (card.querySelector(`.no-msa-check[data-seqid="${seqId}"]`)) {
-    parts.push(`MSA: ${_MSA_MODE_LABELS[_getMsaMode(card)]}`);
-  }
-
-  const tplContainer = card.querySelector(`.tpl-container[data-seqid="${seqId}"]`);
-  let hasTemplates = false;
-  if (tplContainer) {
-    const noTpl = card.querySelector('.no-templates-check')?.checked;
-    hasTemplates = !noTpl && tplContainer.querySelectorAll('.tpl-entry').length > 0;
-    parts.push(noTpl ? 'Templates: off' : `Templates: ${tplContainer.querySelectorAll('.tpl-entry').length}`);
-  }
-
-  // AF3x rejects chains with custom templates but MSA left on Auto — it must
-  // be set explicitly either way (see _getMsaMode). Surface that early.
-  const warnEl = card.querySelector(`.msa-tpl-warning[data-seqid="${seqId}"]`);
-  if (warnEl) warnEl.style.display = (hasTemplates && _getMsaMode(card) === 'auto') ? '' : 'none';
-
-  subEl.textContent = parts.length ? `— ${parts.join(' · ')}` : '';
-}
-
-function _advancedBlock(type, id) {
-  const descSection = `
-    <div class="adv-section">
-      <label class="adv-label" for="desc_${id}">Description
-        <span class="label-hint" data-tip="Free-text comment for this chain — purely cosmetic, not used by AF3x for prediction. Completely optional; leave blank if you don't need it.">?</span>
-      </label>
-      <input type="text" class="seq-description" id="desc_${id}" data-seqid="${id}"
-             placeholder="Optional — e.g. &quot;bait protein&quot; (not used by AF3x, just a label in the JSON)">
-    </div>`;
-
-  if (type === 'ligand') return descSection;
-
-  const modLabel = type === 'protein' ? 'Post-translational Modification' : 'Base Modifications';
-  const modSection = `
-    <div class="adv-section">
-      <div class="adv-section-header">
-        <span>${modLabel}
-          <span class="label-hint" data-tip="Post-translational modifications (e.g. phosphorylation, methylation) or RNA/DNA base modifications applied at a specific residue position. Click ⋯ on a row to search by name or CCD code.">?</span>
-        </span>
-        <div class="adv-section-actions"></div>
-        <button class="btn btn-outline btn-xs add-mod-btn" data-seqid="${id}">+ Add PTM</button>
-      </div>
-      <div class="mods-container" data-seqid="${id}"></div>
-    </div>`;
-
-  // DNA has no MSA support per AF3x spec
-  const msaSection = type === 'dna' ? '' : `
-    <div class="adv-section">
-      <div class="adv-section-header">
-        <span>MSA
-          <span class="label-hint" data-tip="Multiple Sequence Alignment — homologous sequences AF3 uses for coevolution signal. By default AF3 searches and builds it for you (recommended). Without MSA: skip it entirely (faster, but usually lower accuracy). Add custom MSA: supply your own pre-computed .a3m file(s) instead of letting AF3 search.">?</span>
-        </span>
-        <div class="adv-section-actions">
-          <label class="no-tpl-label no-msa-label" title="Sets unpairedMsa/pairedMsa to '' — disables MSA search/usage for this chain">
-            <input type="checkbox" class="no-msa-check" data-seqid="${id}">
-            Without MSA
-          </label>
-        </div>
-        <button class="btn btn-outline btn-xs add-msa-btn" data-seqid="${id}">+ Add custom MSA</button>
-      </div>
-      <p class="adv-hint no-msa-hint" data-seqid="${id}">If no custom MSA is added, AF3 searches automatically.</p>
-      <div class="msa-custom-wrap subsection" data-seqid="${id}" style="display:none">
-        <div class="tpl-entry-header">
-          <span class="tpl-entry-title">Custom MSA</span>
-          <button class="btn-icon remove-msa-btn" data-seqid="${id}" title="Remove custom MSA">✕</button>
-        </div>
-        <div class="msa-file-row">
-          <span class="msa-file-label">Unpaired</span>
-          <input type="text" class="msa-unpaired-path"
-                 placeholder="/path/to/MSAs_A_unpaired.a3m" data-seqid="${id}">
-          <label class="btn btn-ghost btn-xs msa-upload-label" title="Upload .a3m file — content is embedded inline in JSON">
-            Upload MSA file <input type="file" class="msa-unpaired-file" accept=".a3m,.txt" data-seqid="${id}" style="display:none">
-          </label>
-          <textarea class="msa-unpaired-content" style="display:none" data-seqid="${id}"></textarea>
-        </div>
-        ${type === 'protein' ? `
-        <div class="msa-file-row">
-          <span class="msa-file-label">Paired</span>
-          <input type="text" class="msa-paired-path"
-                 placeholder="/path/to/MSAs_A_paired.a3m" data-seqid="${id}">
-          <label class="btn btn-ghost btn-xs msa-upload-label" title="Upload .a3m file — content is embedded inline in JSON">
-            Upload MSA file <input type="file" class="msa-paired-file" accept=".a3m,.txt" data-seqid="${id}" style="display:none">
-          </label>
-          <textarea class="msa-paired-content" style="display:none" data-seqid="${id}"></textarea>
-        </div>` : ''}
-        <p class="adv-hint msa-path-hint">Enter a file path for cluster use
-          (<code>unpairedMsaPath</code>), or upload a local .a3m file
-          (embedded inline as <code>unpairedMsa</code>). Path takes priority over upload.</p>
-        <p class="msa-val-msg" data-seqid="${id}" style="display:none"></p>
-      </div>
-    </div>`;
-
-  const tplSection = type === 'protein' ? `
-    <div class="adv-section">
-      <div class="adv-section-header">
-        <span>Structural Templates
-          <span class="label-hint" data-tip="Known structures of homologous proteins AF3 can use to guide folding. Leave empty for AF3 to search automatically, add specific ones manually, or check 'Without templates' to disable template search for this chain entirely.">?</span>
-        </span>
-        <div class="adv-section-actions">
-          <label class="no-tpl-label" title="Output templates:[] — disables AF3 template search for this chain">
-            <input type="checkbox" class="no-templates-check" data-seqid="${id}">
-            Without templates
-          </label>
-        </div>
-        <button class="btn btn-outline btn-xs add-tpl-btn" data-seqid="${id}">+ Add template</button>
-      </div>
-      <p class="adv-hint no-tpl-hint" data-seqid="${id}">If no templates are added, AF3 searches automatically.</p>
-      <p class="adv-hint msa-tpl-warning" data-seqid="${id}" style="display:none; color:var(--danger)">
-        ⚠ AF3x rejects this: when a chain has custom templates, MSA can't be left on Auto — it
-        must also be set explicitly. Pick <strong>Without MSA</strong> or add a custom MSA above.
-      </p>
-      <div class="tpl-container" data-seqid="${id}"></div>
-    </div>` : '';
-
-  return descSection + modSection + msaSection + tplSection;
-}
-
-// ── Tab wiring (input modes) ──────────────────────────────────────────────────
-
-function _wireSeqInputTabs(card, type, id) {
-  const tabs   = card.querySelectorAll('.input-tabs .tab-btn');
-  const panels = card.querySelectorAll('.tab-panel');
-
-  tabs.forEach(tab => {
-    tab.addEventListener('click', () => {
-      tabs.forEach(t => t.classList.remove('active'));
-      panels.forEach(p => { p.style.display = 'none'; p.classList.remove('active'); });
-      tab.classList.add('active');
-      const panel = card.querySelector(`.tab-panel[data-panel="${tab.dataset.tab}"]`);
-      if (panel) { panel.style.display = 'block'; panel.classList.add('active'); }
-    });
-  });
-
-  // Sequence textarea: edit mode + auto-uppercase
-  const seqTA   = card.querySelector('.seq-textarea');
-  const display = card.querySelector('.seq-display');
-
-  // Initial state: textarea visible (no sequence yet), display hidden
-  if (display) display.style.display = 'none';
-
-  if (seqTA) {
-    let _upperTimer = null;
-
-    // While typing: resize textarea, validate, update viz — stay in edit mode
-    seqTA.addEventListener('input', () => {
-      seqTA.style.height = 'auto';
-      seqTA.style.height = seqTA.scrollHeight + 'px';
-      _autoValidateSeq(seqTA, type);
-      updateViz();
-
-      // Auto-uppercase after 1.5 s of no typing
-      clearTimeout(_upperTimer);
-      _upperTimer = setTimeout(() => {
-        const upper = seqTA.value.toUpperCase();
-        if (seqTA.value !== upper) {
-          const pos = seqTA.selectionStart;
-          seqTA.value = upper;
-          seqTA.setSelectionRange(pos, pos);
-          _autoValidateSeq(seqTA, type);
-          seqTA.style.height = 'auto';
-          seqTA.style.height = seqTA.scrollHeight + 'px';
-        }
-      }, 1500);
-    });
-
-    // On blur: switch to formatted display mode
-    seqTA.addEventListener('blur', () => _updateRuler(card));
-  }
-
-  // Click display → residue selection (only in pick mode) OR enter edit mode
-  if (display && seqTA) {
-    display.addEventListener('click', e => {
-      const resSpan = e.target.closest('.seq-res');
-
-      // SS bond residue pick mode: first click → slot A, second click → slot B + close
-      if (resSpan && _ssPickState) {
-        e.stopPropagation();
-        const pos      = parseInt(resSpan.dataset.pos);
-        const chainIds = (display.dataset.chainId || '').split(',').filter(Boolean);
-        if (pos && chainIds.length) {
-          const { row, slot } = _ssPickState;
-          row.querySelector(`.ss-chain-${slot}`).value = chainIds[0];
-          row.querySelector(`.ss-pos-${slot}`).value   = pos;
-          if (slot === 'a') {
-            _ssPickState.slot = 'b';  // advance to second residue
-            document.querySelectorAll('.seq-card').forEach(c => _updateRuler(c));
-          } else {
-            _exitSsPickMode();
-          }
-          updateViz();
-        }
-        return;
-      }
-
-      // XL pair row pick mode: first click → END1 (chain-a / pos-a), second → END2 + close
-      if (resSpan && _xlRowPickState) {
-        e.stopPropagation();
-        const pos      = parseInt(resSpan.dataset.pos);
-        const chainIds = (display.dataset.chainId || '').split(',').filter(Boolean);
-        if (pos && chainIds.length) {
-          const { row, slot } = _xlRowPickState;
-          const suffix = slot === 'a' ? 'a' : 'b';
-          row.querySelector(`.xl-chain-${suffix}`).value = chainIds[0];
-          row.querySelector(`.xl-pos-${suffix}`).value   = pos;
-          if (slot === 'a') {
-            _xlRowPickState.slot = 'b';
-            const textEl = document.getElementById('xl-pick-banner-text');
-            if (textEl) textEl.textContent = `${chainIds[0]}:${pos} — click second residue (END2)`;
-          } else {
-            _exitXlRowPickMode();
-          }
-          updateViz();
-        }
-        return;
-      }
-
-      // Mod residue pick mode: clicking a residue fills the position input
-      if (resSpan && _modPickState?.seqId === id) {
-        e.stopPropagation();
-        const pos = parseInt(resSpan.dataset.pos);
-        if (pos) {
-          const posEl = _modPickState.row.querySelector('.mod-pos');
-          const warnEl = _modPickState.row.querySelector('.mod-pos-warn');
-          const ccd = (_modPickState.row.querySelector('.mod-ccd')?.value || '').trim().toUpperCase();
-          if (posEl) posEl.value = pos;
-          _validateModRow(ccd, pos, id, warnEl);
-          _exitModPickMode();
-        }
-        return;
-      }
-
-      if (resSpan && (_xlPickMode || _xlPickState)) {
-        e.stopPropagation();
-        const pos      = parseInt(resSpan.dataset.pos);
-        const chainIds = (display.dataset.chainId || '').split(',').filter(Boolean);
-        if (pos && chainIds.length) _handleResidueClick(chainIds[0], pos, resSpan);
-        return;
-      }
-      // Background click in pick mode: cancel pending state only, don't enter edit mode
-      if (_xlPickState) { _clearPickState(); return; }
-      // Normal: enter edit mode
-      display.style.display = 'none';
-      seqTA.style.display   = 'block';
-      seqTA.style.height    = 'auto';
-      seqTA.style.height    = seqTA.scrollHeight + 'px';
-      seqTA.focus();
-    });
-
-    // Tooltip for XL- and PTM-highlighted residues, and residue position in pick mode
-    const tooltip = document.getElementById('arc-tooltip');
-    display.addEventListener('mouseover', e => {
-      const resSpan = e.target.closest('.seq-res');
-      const xlHl    = e.target.closest('.xl-hl');
-      const modHl   = e.target.closest('.mod-valid, .mod-selected');
-      if (!tooltip) return;
-
-      if (xlHl && xlHl.dataset.xlInfo) {
-        tooltip.innerHTML = `<span class="tip-text">${xlHl.dataset.xlInfo.replace(/\n/g,'<br>')}</span>`;
-        tooltip.style.display = 'block';
-      } else if (modHl && modHl.dataset.modInfo) {
-        tooltip.innerHTML = `<span class="tip-text">${modHl.dataset.modInfo}</span>`;
-        tooltip.style.display = 'block';
-      } else if (resSpan) {
-        const pos      = resSpan.dataset.pos;
-        const chainId  = (display.dataset.chainId || '').split(',')[0];
-        const aa       = resSpan.textContent;
-        const posLabel = chainId ? `${chainId} · ${pos}` : `pos ${pos}`;
-        const color    = getComputedStyle(display.closest('.seq-card') || document.body)
-                           .getPropertyValue('--chain-color').trim() || 'var(--primary)';
-        tooltip.style.setProperty('--tip-chain-color', color);
-        tooltip.innerHTML = `<span class="tip-res-aa">${aa}</span><span class="tip-res-pos">${posLabel}</span>`;
-        tooltip.style.display = 'block';
+  const numW = Math.max(4, String(seq.length).length + 1);
+  const lines = [];
+  for (let i = 0; i < seq.length; i += perLine) {
+    let line = `<span class="n">${String(i + 1).padStart(numW)}</span> `;
+    for (let j = i; j < Math.min(seq.length, i + perLine); j++) {
+      if (j > i && (j - i) % 10 === 0) line += ' ';
+      const p = j + 1;
+      const h = hl.get(p);
+      if (h) {
+        if (h.tips.length) card._tips.set(p, h.tips);
+        line += `<span class="r ${h.cls.join(' ')}" data-p="${p}"` +
+          (h.color ? ` style="--h:${h.color}"` : '') +
+          (h.pids.length ? ` data-k="${h.pids.join(' ')}"` : '') + `>${seq[j]}</span>`;
       } else {
-        tooltip.style.display = 'none';
+        line += `<span class="r" data-p="${p}">${seq[j]}</span>`;
       }
-    });
-    display.addEventListener('mousemove', e => {
-      if (tooltip && tooltip.style.display === 'block') {
-        tooltip.style.left = (e.clientX + 16) + 'px';
-        tooltip.style.top  = (e.clientY - 32) + 'px';
-      }
-    });
-    display.addEventListener('mouseleave', () => {
-      if (tooltip) tooltip.style.display = 'none';
-    });
+    }
+    lines.push(line);
   }
+  view.innerHTML = lines.join('\n');
+}
 
-  // Ligand CCD/SMILES tabs
-  if (type === 'ligand') {
-    const ltabs = card.querySelectorAll('.ligand-body .tab-btn');
-    const lpanels = card.querySelectorAll('.ligand-body .tab-panel');
-    ltabs.forEach(tab => {
-      tab.addEventListener('click', () => {
-        ltabs.forEach(t => t.classList.remove('active'));
-        lpanels.forEach(p => { p.style.display = 'none'; p.classList.remove('active'); });
-        tab.classList.add('active');
-        const panel = card.querySelector(`.ligand-body .tab-panel[data-panel="${tab.dataset.tab}"]`);
-        if (panel) { panel.style.display = 'block'; panel.classList.add('active'); }
+function renderSeqViews(model) {
+  const maps = new Map(); // card → Map(pos → highlight)
+  const cardOf = new Map();
+  model.chains.forEach(c => { if (!cardOf.has(c.id)) cardOf.set(c.id, c.el); maps.set(c.el, new Map()); });
+  const add = (card, pos, cls, o = {}) => {
+    const m = maps.get(card);
+    if (!m || !pos) return;
+    if (!m.has(pos)) m.set(pos, { cls: [], color: null, tips: [], pids: [] });
+    const h = m.get(pos);
+    if (!h.cls.includes(cls)) h.cls.push(cls);
+    if (o.color && !h.color) h.color = o.color;
+    if (o.tip) h.tips.push(o.tip);
+    if (o.pid) h.pids.push(o.pid);
+  };
+  const aaAt = (id, p) => model.chains.find(c => c.id === id)?.seq[p - 1] || '';
+
+  model.xl.forEach(g => g.pairs.forEach(p => {
+    if (!(p.c1 && p.p1 && p.c2 && p.p2)) return;
+    const pid = p.el.dataset.pid;
+    add(cardOf.get(p.c1), p.p1, 'h-xl', { color: g.color, pid, tip: `${g.name} – ${p.c2}:${aaAt(p.c2, p.p2)}${p.p2}` });
+    add(cardOf.get(p.c2), p.p2, 'h-xl', { color: g.color, pid, tip: `${g.name} – ${p.c1}:${aaAt(p.c1, p.p1)}${p.p1}` });
+  }));
+  model.ss.forEach(b => {
+    if (!(b.c1 && b.p1 && b.c2 && b.p2)) return;
+    const pid = b.el.dataset.pid;
+    add(cardOf.get(b.c1), b.p1, 'h-ss', { pid, tip: `S–S – ${b.c2}:${b.p2}` });
+    add(cardOf.get(b.c2), b.p2, 'h-ss', { pid, tip: `S–S – ${b.c1}:${b.p1}` });
+  });
+  model.chains.forEach(c => c.mods.forEach(m => {
+    const ptm = PTM_DATABASE.find(x => x.ccd === m.ccd);
+    add(c.el, m.pos, 'h-mod', { tip: ptm ? `${m.ccd} · ${ptm.name}` : m.ccd });
+  }));
+
+  model.chains.forEach(c => {
+    const ok = ALPHABET[c.type];
+    if (ok) [...c.seq].forEach((ch, i) => { if (!ok.has(ch)) add(c.el, i + 1, 'h-bad', { tip: 'not allowed here' }); });
+  });
+
+  if (pending) {
+    if (pending.kind === 'ss') {
+      model.chains.filter(c => c.type === 'protein').forEach(c => {
+        [...c.seq].forEach((aa, i) => { if (aa === 'C') add(c.el, i + 1, 'h-cand'); });
       });
-    });
+    } else if (pending.kind === 'mod') {
+      const seq = pending.card._seq;
+      [...seq].forEach((aa, i) => { if (!pending.target || aa === pending.target) add(pending.card, i + 1, 'h-cand'); });
+    }
+  }
+  maps.forEach((hl, card) => { if (card.dataset.type !== 'ligand') renderSeq(card, hl); });
+  // the selected residue is marked in place: rebuilding the view between two clicks would swallow the second
+  document.querySelectorAll('.r.h-sel').forEach(el => el.classList.remove('h-sel'));
+  if (pending?.pos) pending.card.querySelector(`.r[data-p="${pending.pos}"]`)?.classList.add('h-sel');
+}
+
+// ── Residue actions ──────────────────────────────────────────────────────────
+
+function setPending(p) {
+  pending = p;
+  const bar = $('pickBar');
+  const text = $('pickBarText');
+  bar.querySelectorAll('.pick-act').forEach(b => b.remove());
+  if (!p) { bar.hidden = true; document.body.classList.remove('picking'); touch(); return; }
+  const id = cardId(p.card);
+  const aa = p.pos ? p.card._seq[p.pos - 1] : '';
+  const act = (label, title, fn) => {
+    const b = document.createElement('button');
+    b.className = 'pick-act';
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener('click', fn);
+    $('pickBarCancel').before(b);
+  };
+  if (p.kind === 'xl') {
+    const protein = p.card.dataset.type === 'protein';
+    text.innerHTML = `<b>${esc(id)} · ${aa}${p.pos}</b>` + (protein ? ' click another residue to crosslink' : '');
+    act('Modification', 'Phosphorylation, methylation, …', () => openPtm(p.card, p.pos));
+    if (!p.card._features) act('Edit sequence', 'Also: double-click the sequence', () => editSeq(p.card, p.pos));
+    if (protein && aa === 'C') act('Disulfide', 'Bond to another cysteine', () => setPending({ ...p, kind: 'ss' }));
+  } else if (p.kind === 'ss') {
+    text.innerHTML = `<b>${esc(id)} · C${p.pos}</b> click the second cysteine`;
+  } else if (p.kind === 'mod') {
+    text.innerHTML = `<b>${esc(p.ccd)}</b> click ${p.target ? `a residue ${p.target}` : 'a residue'} in chain ${esc(id)}`;
+  }
+  bar.hidden = false;
+  document.body.classList.add('picking');
+  touch();
+}
+
+function clearPending() {
+  if (pending) setPending(null);
+}
+
+function onResidueClick(card, span) {
+  const pos = parseInt(span.dataset.p, 10);
+  const id = cardId(card);
+  const aa = card._seq[pos - 1];
+  const type = card.dataset.type;
+
+  if (pending?.kind === 'mod') {
+    if (pending.card !== card) { toast(`Click a residue in chain ${cardId(pending.card)}`); return; }
+    addMod(card, pending.ccd, pos);
+    clearPending();
     return;
   }
-
-  // Auto-detect FASTA paste in the sequence textarea
-  const seqTa = card.querySelector('.seq-textarea');
-  if (seqTa) {
-    seqTa.addEventListener('paste', e => {
-      // On next tick, check if pasted content looks like FASTA
-      setTimeout(() => {
-        if (seqTa.value.trimStart().startsWith('>') || seqTa.value.trimStart().startsWith(';')) {
-          const entries = _parseFastaAll(seqTa.value);
-          if (entries.length === 1) {
-            seqTa.value = entries[0].seq;
-            _autoValidateSeq(seqTa, type);
-            _updateRuler(card);
-            updateViz();
-          } else if (entries.length > 1) {
-            seqTa.value = '';
-            _showFastaSelectModal(entries, card);
-          }
-        }
-      }, 0);
-    });
+  if (pending?.kind === 'ss') {
+    if (pending.card === card && pending.pos === pos) { clearPending(); return; }
+    if (type !== 'protein' || aa !== 'C') { toast('Pick a cysteine'); return; }
+    addSs({ c1: cardId(pending.card), p1: pending.pos, c2: id, p2: pos });
+    clearPending();
+    return;
   }
-
-  // Modification button
-  const addModBtn = card.querySelector('.add-mod-btn');
-  if (addModBtn) {
-    addModBtn.addEventListener('click', () => {
-      _openPTMPicker(id, null);
-    });
+  if (pending?.kind === 'xl') {
+    if (pending.card === card && pending.pos === pos) { clearPending(); return; }
+    if (pending.card.dataset.type === 'protein' && type === 'protein') {
+      addClickedPair({ c1: cardId(pending.card), p1: pending.pos, c2: id, p2: pos });
+      clearPending();
+      return;
+    }
   }
-
-  // Template button
-  const addTplBtn = card.querySelector('.add-tpl-btn');
-  if (addTplBtn) {
-    addTplBtn.addEventListener('click', () => _addTemplate(card, id));
-  }
-
-  // "Without templates" checkbox
-  const noTplCheck = card.querySelector('.no-templates-check');
-  if (noTplCheck) {
-    const _applyNoTpl = () => {
-      const off = noTplCheck.checked;
-      if (addTplBtn) addTplBtn.disabled = off;
-      const hint = card.querySelector('.no-tpl-hint');
-      if (hint) hint.textContent = off
-        ? 'Template search disabled for this chain (templates: [] in JSON).'
-        : 'If no templates are added, AF3 searches automatically.';
-      const tplContainer = card.querySelector('.tpl-container');
-      if (tplContainer) tplContainer.style.opacity = off ? '0.35' : '';
-      _updateAdvancedSummary(id);
-    };
-    noTplCheck.addEventListener('change', _applyNoTpl);
-    _applyNoTpl();
-  }
-
-  // MSA: "+ Add custom MSA" / "Without MSA" / remove
-  const msaCustomWrap = card.querySelector(`.msa-custom-wrap[data-seqid="${id}"]`);
-  const addMsaBtn     = card.querySelector(`.add-msa-btn[data-seqid="${id}"]`);
-  const noMsaCheck    = card.querySelector(`.no-msa-check[data-seqid="${id}"]`);
-
-  if (msaCustomWrap) {
-    if (addMsaBtn) {
-      addMsaBtn.addEventListener('click', () => {
-        msaCustomWrap.style.display = 'block';
-        if (noMsaCheck && noMsaCheck.checked) {
-          noMsaCheck.checked = false;
-          noMsaCheck.dispatchEvent(new Event('change'));
-        }
-        _updateAdvancedSummary(id);
-      });
-    }
-
-    const removeMsaBtn = card.querySelector(`.remove-msa-btn[data-seqid="${id}"]`);
-    if (removeMsaBtn) {
-      removeMsaBtn.addEventListener('click', () => {
-        msaCustomWrap.style.display = 'none';
-        card.querySelectorAll(
-          `.msa-unpaired-path[data-seqid="${id}"], .msa-unpaired-content[data-seqid="${id}"],
-           .msa-paired-path[data-seqid="${id}"], .msa-paired-content[data-seqid="${id}"]`
-        ).forEach(el => { el.value = ''; delete el.dataset.isUpload; });
-        _updateAdvancedSummary(id);
-      });
-    }
-
-    if (noMsaCheck) {
-      const _applyNoMsa = () => {
-        const off = noMsaCheck.checked;
-        if (addMsaBtn) addMsaBtn.disabled = off;
-        const hint = card.querySelector(`.no-msa-hint[data-seqid="${id}"]`);
-        if (hint) hint.textContent = off
-          ? 'MSA disabled for this chain (unpairedMsa/pairedMsa: "" in JSON).'
-          : 'If no custom MSA is added, AF3 searches automatically.';
-        if (off) msaCustomWrap.style.display = 'none';
-        _updateAdvancedSummary(id);
-      };
-      noMsaCheck.addEventListener('change', _applyNoMsa);
-      _applyNoMsa();
-    }
-
-    // File upload: unpaired
-    const _showMsaVal = (msgs, isError) => {
-      const el = card.querySelector(`.msa-val-msg[data-seqid="${id}"]`);
-      if (!el) return;
-      if (!msgs.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
-      el.style.display = 'block';
-      el.style.color   = isError ? 'var(--danger)' : 'var(--warning, #b45309)';
-      el.innerHTML     = msgs.map(m => `<div>${isError ? '✗' : '⚠'} ${m}</div>`).join('');
-    };
-
-    const _runMsaValidation = (a3mText, label) => {
-      const chainSeq = (card.querySelector('.seq-textarea')?.value || '').replace(/\s/g, '').toUpperCase();
-      const { errors, warnings } = _validateA3m(a3mText, chainSeq || null);
-      if (errors.length)        _showMsaVal(errors.map(e => `${label}: ${e}`), true);
-      else if (warnings.length) _showMsaVal(warnings.map(w => `${label}: ${w}`), false);
-      else                      _showMsaVal([], false);
-    };
-
-    const unpairedFile = card.querySelector('.msa-unpaired-file');
-    if (unpairedFile) {
-      unpairedFile.addEventListener('change', () => {
-        const file = unpairedFile.files[0];
-        if (!file) return;
-        const pathInput   = card.querySelector('.msa-unpaired-path');
-        const contentArea = card.querySelector('.msa-unpaired-content');
-        const reader = new FileReader();
-        reader.onload = e => {
-          if (pathInput)   { pathInput.value = file.name; pathInput.dataset.isUpload = 'true'; }
-          if (contentArea) contentArea.value = e.target.result;
-          _runMsaValidation(e.target.result, 'Unpaired MSA');
-          _updateAdvancedSummary(id);
-        };
-        reader.readAsText(file);
-      });
-    }
-
-    // File upload: paired
-    const pairedFile = card.querySelector('.msa-paired-file');
-    if (pairedFile) {
-      pairedFile.addEventListener('change', () => {
-        const file = pairedFile.files[0];
-        if (!file) return;
-        const pathInput   = card.querySelector('.msa-paired-path');
-        const contentArea = card.querySelector('.msa-paired-content');
-        const reader = new FileReader();
-        reader.onload = e => {
-          if (pathInput)   { pathInput.value = file.name; pathInput.dataset.isUpload = 'true'; }
-          if (contentArea) contentArea.value = e.target.result;
-          _runMsaValidation(e.target.result, 'Paired MSA');
-          _updateAdvancedSummary(id);
-        };
-        reader.readAsText(file);
-      });
-    }
-
-    // Clear isUpload flag when user manually edits the path
-    card.querySelectorAll('.msa-unpaired-path, .msa-paired-path').forEach(inp => {
-      inp.addEventListener('input', () => {
-        delete inp.dataset.isUpload;
-        _updateAdvancedSummary(id);
-      });
-    });
-  }
+  setPending({ kind: 'xl', card, pos });
 }
 
-// ── Sequence helpers ──────────────────────────────────────────────────────────
+// ── Modifications ────────────────────────────────────────────────────────────
 
-function _extractFasta(text) {
-  const lines = text.split('\n');
-  let seq = '';
-  for (const line of lines) {
-    const l = line.trim();
-    if (!l || l.startsWith('>') || l.startsWith(';')) continue;
-    seq += l.toUpperCase();
-  }
-  return seq || null;
+function addMod(card, ccd, pos) {
+  ccd = String(ccd || '').trim().toUpperCase().replace(/^CCD_/, '');
+  if (!ccd || !pos) return;
+  const chip = document.createElement('span');
+  chip.className = 'chip mod-chip';
+  chip.dataset.ccd = ccd;
+  chip.dataset.pos = pos;
+  chip.innerHTML = `<b>${esc(ccd)}</b><span class="chip-at"></span><button class="chip-x" aria-label="Remove ${esc(ccd)}">×</button>`;
+  card.querySelector('.opt-mods .chips').appendChild(chip);
+  card.querySelector('.opt-mods').hidden = false;
+  touch();
 }
 
-function _parseFastaAll(text) {
-  const entries = [];
-  let current = null;
-  for (const line of text.split('\n')) {
-    const l = line.trim();
-    if (l.startsWith('>') || l.startsWith(';')) {
-      if (current && current.seq) entries.push(current);
-      current = { header: l.slice(1).trim(), seq: '' };
-    } else if (l && current) {
-      current.seq += l.toUpperCase().replace(/[^A-Za-z]/g, '');
-    }
-  }
-  if (current && current.seq) entries.push(current);
-  return entries;
+let _ptm = null; // { card, pos }
+
+function openPtm(card, pos = null) {
+  _ptm = { card, pos };
+  const id = cardId(card);
+  $('ptmTitle').textContent = pos ? `Modify ${id} · ${card._seq[pos - 1]}${pos}` : `Modification in chain ${id}`;
+  $('ptmSearch').value = '';
+  renderPtm();
+  showModal('ptm-modal');
 }
 
-function _showFastaSelectModal(entries, targetCard) {
-  const modal = document.getElementById('fasta-select-modal');
-  if (!modal) return;
-
-  const isSingle = !!targetCard;
-  const list     = modal.querySelector('#fasta-select-list');
-  const title    = modal.querySelector('#fasta-select-title');
-  const confirmBtn = modal.querySelector('#fasta-select-confirm');
-  if (!list || !confirmBtn) return;
-
-  if (title) title.textContent = isSingle
-    ? 'Multiple sequences found — select one to import:'
-    : `${entries.length} sequence${entries.length > 1 ? 's' : ''} found — select which to import:`;
-
-  list.innerHTML = entries.map((e, i) => `
-    <label class="fasta-select-row">
-      <input type="${isSingle ? 'radio' : 'checkbox'}" name="fasta-seq-pick" value="${i}" checked>
-      <span class="fasta-seq-header" title="${e.header || ''}">${e.header || `Sequence ${i + 1}`}</span>
-      <span class="fasta-seq-len">${e.seq.length} aa</span>
-    </label>
-  `).join('');
-
-  modal.dataset.targetCard = targetCard ? targetCard.dataset.seqid || '' : '';
-  modal._fastaEntries = entries;
-  modal._isSingle     = isSingle;
-
-  modal.style.display = 'flex';
-
-  confirmBtn.onclick = () => {
-    const checked = [...list.querySelectorAll('input:checked')].map(i => parseInt(i.value));
-    const selected = checked.map(i => entries[i]).filter(Boolean);
-    if (!selected.length) return;
-
-    if (isSingle) {
-      _setSeqAndSwitchToText(targetCard, selected[0].seq, _cardType(targetCard));
-    } else {
-      _importFastaEntries(selected);
-    }
-    modal.style.display = 'none';
-  };
-}
-
-function _cardType(card) {
-  return card?.querySelector('.seq-type-label')?.textContent.toLowerCase() || 'protein';
-}
-
-function _importFastaEntries(entries) {
-  entries.forEach((entry, idx) => {
-    let card = null;
-
-    // For the first entry, reuse the last card if it's still empty
-    if (idx === 0) {
-      const cards = document.querySelectorAll('#sequences-container .seq-card');
-      const last  = cards[cards.length - 1];
-      const lastTa = last?.querySelector('.seq-textarea');
-      if (last && lastTa && !lastTa.value.trim()) card = last;
-    }
-
-    if (!card) {
-      addSequenceCard('protein');
-      const cards = document.querySelectorAll('#sequences-container .seq-card');
-      card = cards[cards.length - 1];
-    }
-    if (!card) return;
-
-    const ta = card.querySelector('.seq-textarea');
-    if (ta) {
-      ta.value = entry.seq;
-      _autoValidateSeq(ta, 'protein');
-      _updateRuler(card);
-    }
+function renderPtm() {
+  const { card, pos } = _ptm;
+  const type = card.dataset.type;
+  const aa = pos ? card._seq[pos - 1] : null;
+  const q = $('ptmSearch').value.trim().toLowerCase();
+  const pool = PTM_DATABASE.filter(p => {
+    const nucleic = p.category === 'RNA modification' ? 'rna' : p.category === 'DNA modification' ? 'dna' : 'protein';
+    if (nucleic !== type) return false;
+    if (aa && p.targetAA !== aa) return false;
+    return !q || `${p.ccd} ${p.name} ${p.description} ${p.category}`.toLowerCase().includes(q);
   });
-  updateViz();
-}
-
-function _initSeqReorder() {
-  const container = document.getElementById('sequences-container');
-  if (!container) return;
-
-  let dragSrc = null;
-
-  container.addEventListener('dragstart', e => {
-    const card = e.target.closest('.seq-card');
-    if (!card || !card.draggable) return;
-    dragSrc = card;
-    card.classList.add('seq-dragging');
-    e.dataTransfer.effectAllowed = 'move';
-  });
-
-  container.addEventListener('dragover', e => {
-    if (!dragSrc) return;
-    const card = e.target.closest('.seq-card');
-    if (!card || card === dragSrc) return;
-    e.preventDefault();
-    const mid = card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
-    container.querySelectorAll('.seq-card').forEach(c => c.classList.remove('drag-over-top', 'drag-over-bottom'));
-    card.classList.add(e.clientY < mid ? 'drag-over-top' : 'drag-over-bottom');
-  });
-
-  container.addEventListener('dragleave', e => {
-    if (!e.target.closest('.seq-card')) return;
-    e.target.closest('.seq-card').classList.remove('drag-over-top', 'drag-over-bottom');
-  });
-
-  container.addEventListener('drop', e => {
-    if (!dragSrc) return;
-    const card = e.target.closest('.seq-card');
-    if (!card || card === dragSrc) { _resetDrag(container, dragSrc); return; }
-    e.preventDefault();
-    const mid = card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
-    container.insertBefore(dragSrc, e.clientY < mid ? card : card.nextSibling);
-    _resetDrag(container, dragSrc);
-    updateViz();
-  });
-
-  container.addEventListener('dragend', () => { _resetDrag(container, dragSrc); dragSrc = null; });
-}
-
-function _resetDrag(container, dragSrc) {
-  if (dragSrc) { dragSrc.draggable = false; dragSrc.classList.remove('seq-dragging'); }
-  container.querySelectorAll('.seq-card').forEach(c => c.classList.remove('drag-over-top', 'drag-over-bottom'));
-}
-
-function _validateA3m(a3mText, querySeq) {
-  const errors   = [];
-  const warnings = [];
-
-  // Parse entries: header lines start with '>'
-  const lines   = a3mText.replace(/\r\n?/g, '\n').split('\n');
-  const entries = [];
-  let cur = null;
-  for (const line of lines) {
-    if (line.startsWith('>')) {
-      if (cur) entries.push(cur);
-      cur = { header: line.slice(1).trim(), seq: '' };
-    } else if (cur) {
-      cur.seq += line.trim();
+  const list = $('ptmList');
+  list.innerHTML = '';
+  let cat = null;
+  for (const p of pool) {
+    if (p.category !== cat) {
+      cat = p.category;
+      list.appendChild(Object.assign(document.createElement('div'), { className: 'menu-heading', textContent: cat }));
     }
+    const b = document.createElement('button');
+    b.className = 'ptm-item';
+    b.innerHTML = `<b>${esc(p.ccd)}</b><span>${esc(p.name)}</span><i>${esc(p.targetAA)}</i>`;
+    b.title = p.description;
+    b.addEventListener('click', () => choosePtm(p.ccd));
+    list.appendChild(b);
   }
-  if (cur) entries.push(cur);
-
-  if (entries.length === 0) {
-    errors.push('A3M file is empty or contains no valid FASTA entries');
-    return { errors, warnings };
+  const code = q.toUpperCase();
+  if (/^[A-Z0-9]{1,5}$/.test(code) && !pool.some(p => p.ccd === code)) {
+    const b = document.createElement('button');
+    b.className = 'ptm-item';
+    b.innerHTML = `<b>${esc(code)}</b><span>Use this CCD code</span>`;
+    b.addEventListener('click', () => choosePtm(code));
+    list.appendChild(b);
   }
-
-  // ── First sequence (query) checks ─────────────────────────────────────────
-  const firstSeq = entries[0].seq;
-
-  if (/[a-z]/.test(firstSeq))
-    errors.push('A3M first sequence contains lowercase insertion characters — the query must be uppercase only');
-  if (firstSeq.includes('-'))
-    errors.push('A3M first sequence contains gap characters (-) — the query must not have gaps');
-
-  if (querySeq) {
-    const firstUpper = firstSeq.toUpperCase();
-    if (firstUpper.length !== querySeq.length) {
-      errors.push(`A3M first sequence length (${firstUpper.length}) does not match chain sequence length (${querySeq.length})`);
-    } else if (firstUpper !== querySeq) {
-      let pos = -1;
-      for (let i = 0; i < querySeq.length; i++) {
-        if (firstUpper[i] !== querySeq[i]) { pos = i + 1; break; }
-      }
-      if (pos > 0)
-        errors.push(`A3M first sequence mismatch at position ${pos}: expected ${querySeq[pos-1]}, got ${firstUpper[pos-1]}`);
-    }
-  }
-
-  // ── Subsequent hit checks ──────────────────────────────────────────────────
-  const queryLen = querySeq ? querySeq.length : firstSeq.replace(/[a-z]/g, '').length;
-  let badHits = 0;
-  for (let i = 1; i < entries.length; i++) {
-    const aligned = entries[i].seq.replace(/[a-z]/g, '');
-    if (aligned.length !== queryLen) badHits++;
-  }
-  if (badHits > 0)
-    warnings.push(`${badHits} MSA hit(s) have incorrect alignment length after removing insertions (expected ${queryLen} columns)`);
-
-  return { errors, warnings };
-}
-
-function _looksLikeStructureFile(filename, text) {
-  const ext = (filename.split('.').pop() || '').toLowerCase();
-  if (['pdb', 'cif', 'mmcif', 'ent'].includes(ext)) return true;
-  // Content-based fallback for extensionless or ambiguous files
-  const head = text.trimStart().slice(0, 400);
-  return isMmcifText(text) || /^(ATOM|HETATM|HEADER|REMARK|MODEL|COMPND|SEQRES)\s/m.test(head);
-}
-
-function _initGlobalFastaImport() {
-  const input = document.getElementById('fasta-import-file-input');
-  if (!input) return;
-
-  input.addEventListener('change', () => {
-    const file = input.files[0];
-    if (!file) return;
-    input.value = '';
-    const reader = new FileReader();
-    reader.onload = e => _handleFastaFileContent(e.target.result);
-    reader.readAsText(file);
-  });
-
-  // Global drag-and-drop on the sequences card
-  const seqCard = document.getElementById('sequences-card');
-  if (seqCard) {
-    seqCard.addEventListener('dragover', e => { e.preventDefault(); seqCard.classList.add('fasta-drag-over'); });
-    seqCard.addEventListener('dragleave', e => {
-      if (!seqCard.contains(e.relatedTarget)) seqCard.classList.remove('fasta-drag-over');
-    });
-    seqCard.addEventListener('drop', e => {
-      e.preventDefault();
-      seqCard.classList.remove('fasta-drag-over');
-      const file = e.dataTransfer.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = ev => {
-        const text = ev.target.result;
-        if (_looksLikeStructureFile(file.name, text)) {
-          openPdbModal(text, _onPdbImport);
-        } else {
-          _handleFastaFileContent(text);
-        }
-      };
-      reader.readAsText(file);
-    });
-  }
-
-  // Close modal on backdrop click
-  const modal = document.getElementById('fasta-select-modal');
-  if (modal) {
-    modal.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
-    modal.querySelector('#fasta-select-cancel')?.addEventListener('click', () => { modal.style.display = 'none'; });
+  if (!list.children.length) {
+    list.innerHTML = `<div class="menu-empty">${aa && !q ? `No listed modification for ${esc(aa)}. Type a CCD code.` : 'Nothing found. Type a CCD code.'}</div>`;
   }
 }
 
-function _openUniprotModal() {
-  const modal = document.getElementById('uniprot-modal');
-  if (!modal) return;
-  document.getElementById('uniprotModalInput').value = '';
-  const status = document.getElementById('uniprotModalStatus');
-  status.textContent = '';
-  status.className = 'uniprot-status';
-  modal.style.display = 'flex';
-  document.getElementById('uniprotModalInput').focus();
-}
-
-function _initUniprotModal() {
-  const modal     = document.getElementById('uniprot-modal');
-  const input     = document.getElementById('uniprotModalInput');
-  const fetchBtn  = document.getElementById('uniprotModalFetchBtn');
-  const statusEl  = document.getElementById('uniprotModalStatus');
-  if (!modal) return;
-
-  const close = () => { modal.style.display = 'none'; };
-  document.getElementById('uniprotModalClose')?.addEventListener('click', close);
-  document.getElementById('uniprotModalCancel')?.addEventListener('click', close);
-  modal.addEventListener('click', e => { if (e.target === modal) close(); });
-
-  const doFetch = async () => {
-    const uniId = input.value.trim();
-    if (!uniId) return;
-    fetchBtn.disabled = true;
-    statusEl.textContent = 'Fetching…';
-    statusEl.className = 'uniprot-status loading';
-    try {
-      const url = `https://rest.uniprot.org/uniprotkb/${uniId}.fasta`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`UniProt returned ${res.status}`);
-      const text = await res.text();
-      const seq  = _extractFasta(text);
-      if (!seq) throw new Error('No sequence in response');
-      // Reuse existing empty protein card if there is one, otherwise add new
-      const existingCards = document.querySelectorAll('#sequences-container .seq-card');
-      let targetCard = null;
-      for (const c of existingCards) {
-        if (c.dataset.type === 'protein' && !c.querySelector('.seq-textarea')?.value.trim()) {
-          targetCard = c;
-          break;
-        }
-      }
-      if (!targetCard) {
-        addSequenceCard('protein');
-        const all = document.querySelectorAll('#sequences-container .seq-card');
-        targetCard = all[all.length - 1];
-      }
-      _setSeqAndSwitchToText(targetCard, seq, 'protein');
-      targetCard?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      close();
-    } catch (err) {
-      statusEl.textContent = `✗ ${err.message}`;
-      statusEl.className = 'uniprot-status error';
-    } finally {
-      fetchBtn.disabled = false;
-    }
-  };
-
-  fetchBtn.addEventListener('click', doFetch);
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') doFetch(); });
-}
-
-function _handleFastaFileContent(text) {
-  let entries = _parseFastaAll(text);
-  // Fallback: raw sequence with no header
-  if (!entries.length) {
-    const seq = _extractFasta(text);
-    if (seq) entries = [{ header: 'Imported sequence', seq }];
+function choosePtm(ccd) {
+  hideModal('ptm-modal');
+  const { card, pos } = _ptm;
+  if (pos) {
+    addMod(card, ccd, pos);
+    clearPending();
+  } else if (!card._seq) {
+    toast('Add the sequence first');
+  } else {
+    showSeqView(card);
+    const ptm = PTM_DATABASE.find(p => p.ccd === ccd);
+    setPending({ kind: 'mod', card, ccd, target: ptm?.targetAA || null });
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
-  if (!entries.length) { alert('No valid FASTA sequences found in file.'); return; }
-  // Always show modal so user can confirm / choose type
-  _showFastaSelectModal(entries, null);
 }
 
-function _setSeqAndSwitchToText(card, seq, type) {
-  const ta = card.querySelector('.seq-textarea');
-  if (ta) {
-    ta.value = seq;
-    _autoValidateSeq(ta, type);
-    _updateRuler(card);
-    updateViz();
+// ── MSA and templates ────────────────────────────────────────────────────────
+
+/** kind: 'msa' | 'tpl'; mode: 'auto' | 'none' | 'custom'. Auto hides the row unless keep. */
+function setMode(card, kind, mode, keep = false) {
+  card.dataset[kind] = mode;
+  const opt = card.querySelector(`.opt-${kind}`);
+  opt.querySelectorAll('.seg button').forEach(b => b.classList.toggle('on', b.dataset.v === mode));
+  opt.querySelector('.opt-body').hidden = mode !== 'custom';
+  opt.hidden = mode === 'auto' && !keep;
+  if (kind === 'tpl' && mode === 'custom' && !opt.querySelector('.tpl')) addTpl(card);
+  if (mode !== 'custom') {
+    opt.querySelectorAll('.msa-path').forEach(inp => { inp.value = ''; clearInline(inp); });
+    opt.querySelectorAll('.tpl').forEach(t => t.remove());
+    opt.querySelectorAll('.opt-msg').forEach(m => { m.hidden = true; });
   }
-  // Switch to text tab
-  const textTab = card.querySelector('.tab-btn[data-tab="text"]');
-  if (textTab) textTab.click();
+  touch();
 }
 
-async function _fetchUniProt(card, type, id) {
-  const input  = card.querySelector('.uniprot-input');
-  const status = card.querySelector('.uniprot-status');
-  const uniId  = input.value.trim();
-  if (!uniId) return;
+function setInline(input, name, content) {
+  input._inline = content;
+  input.value = name;
+  input.classList.add('inline');
+  input.title = 'Stored in the JSON. Type to replace it with a path.';
+}
 
-  status.textContent = 'Fetching…';
-  status.className   = 'uniprot-status loading';
+function clearInline(input) {
+  delete input._inline;
+  input.classList.remove('inline');
+  input.title = '';
+}
 
+const fileVal = input => (input._inline != null
+  ? { path: '', content: input._inline }
+  : { path: input.value.trim(), content: '' });
+
+function optMsg(el, text, bad = false) {
+  el.hidden = !text;
+  el.innerHTML = text || '';
+  el.classList.toggle('bad', bad);
+}
+
+async function onMsaFile(card, row, file) {
+  const text = await readFileText(file);
+  setInline(row.querySelector('.msa-path'), file.name, text);
+  const { errors, warnings } = validateA3m(text, card._seq || null);
+  const msg = card.querySelector('.opt-msa .opt-msg');
+  const who = row.dataset.slot === 'paired' ? 'Paired' : 'Unpaired';
+  optMsg(msg, [...errors, ...warnings].map(m => `${who}: ${esc(m)}`).join('<br>'), errors.length > 0);
+  touch();
+}
+
+function addTpl(card, d = {}) {
+  const el = document.createElement('div');
+  el.className = 'tpl';
+  el.innerHTML = `
+    <div class="file-row">
+      <span class="file-name">Structure</span>
+      <input class="tpl-path" placeholder="path to .cif on the machine that runs AF3x" spellcheck="false">
+      <label class="btn sm" title="PDB or mmCIF. Aligned to the chain; stored in the JSON.">Upload<input type="file" accept=".cif,.mmcif,.pdb,.ent" hidden></label>
+      <button class="icon-btn tpl-x" title="Remove template" aria-label="Remove template">×</button>
+    </div>
+    <div class="file-row">
+      <span class="file-name" title="Which chain residues match which template residues, counted from 0">Mapping</span>
+      <input class="tpl-q" placeholder="chain residues, from 0: 0-120" spellcheck="false" title="Chain residues, counted from 0">
+      <span class="arrow">→</span>
+      <input class="tpl-t" placeholder="template residues: 4-124" spellcheck="false" title="Template residues, counted from 0">
+    </div>
+    <div class="opt-msg" hidden></div>`;
+  card.querySelector('.tpl-list').appendChild(el);
+  const path = el.querySelector('.tpl-path');
+  if (d.mmcif) setInline(path, 'mmCIF in the JSON', d.mmcif);
+  else if (d.mmcifPath) path.value = d.mmcifPath;
+  if (d.queryIndices) el.querySelector('.tpl-q').value = formatRanges(d.queryIndices);
+  if (d.templateIndices) el.querySelector('.tpl-t').value = formatRanges(d.templateIndices);
+  touch();
+  return el;
+}
+
+async function onTplFile(card, el, file) {
+  const text = await readFileText(file);
+  const msg = el.querySelector('.opt-msg');
+  let chains = [];
   try {
-    const url = `https://rest.uniprot.org/uniprotkb/${uniId}.fasta`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`UniProt returned ${res.status}`);
-    const text = await res.text();
-    const seq  = _extractFasta(text);
-    if (!seq) throw new Error('No sequence in response');
-    _setSeqAndSwitchToText(card, seq, type);
-    // Also update chain-id placeholder with accession
-    status.textContent = `✓ ${uniId} — ${seq.length} residues`;
-    status.className   = 'uniprot-status ok';
-  } catch (err) {
-    status.textContent = `✗ ${err.message}`;
-    status.className   = 'uniprot-status error';
+    chains = extractAtomSequences(text).filter(c => c.sequence && (c.sequence.match(/X/g) || []).length / c.sequence.length < 0.5);
+  } catch { /* handled below */ }
+  if (!chains.length) { optMsg(msg, 'No protein chain found in this file', true); return; }
+  el._src = { text, name: file.name, chains };
+  let best = 0;
+  if (card._seq && chains.length > 1) {
+    let top = -1;
+    chains.forEach((c, i) => {
+      const { alignedA, alignedB } = needlemanWunsch(card._seq, c.sequence);
+      const same = [...alignedA].filter((ch, k) => ch !== '-' && ch === alignedB[k]).length;
+      if (same > top) { top = same; best = i; }
+    });
   }
+  useTplChain(card, el, best);
 }
 
-const VALID_AA  = new Set('ACDEFGHIKLMNPQRSTVWY');
-const VALID_RNA = new Set('AGCU');
-const VALID_DNA = new Set('ACGT');
-
-function _autoValidateSeq(ta, type) {
-  const seq = ta.value.toUpperCase().replace(/\s/g, '');
-  const card = ta.closest('.seq-card');
-  const lenHint = card?.querySelector('.seq-length-hint');
-  const valMsg  = card?.querySelector('.seq-val-msg');
-
-  if (!seq) {
-    ta.classList.remove('valid', 'invalid');
-    if (lenHint) lenHint.textContent = '';
-    if (valMsg)  valMsg.textContent  = '';
+/** Cut one chain out of the uploaded structure, store it, and fill the mapping by alignment. */
+function useTplChain(card, el, idx) {
+  const { text, name, chains } = el._src;
+  const msg = el.querySelector('.opt-msg');
+  let built;
+  try {
+    built = buildTemplate(text, chains[idx].chainId, name.replace(/\.[^.]+$/, ''));
+  } catch (e) {
+    optMsg(msg, esc(e.message), true);
     return;
   }
-
-  const allowed = type === 'protein' ? VALID_AA : type === 'rna' ? VALID_RNA : VALID_DNA;
-  const invalid = [...seq].filter(c => !allowed.has(c));
-
-  if (lenHint) lenHint.textContent = `${seq.length} residues`;
-
-  if (invalid.length) {
-    ta.classList.remove('valid');
-    ta.classList.add('invalid');
-    const sample = [...new Set(invalid)].slice(0, 5).join(', ');
-    if (valMsg) valMsg.textContent = `⚠ Unknown characters: ${sample}`;
+  setInline(el.querySelector('.tpl-path'), `${name} · chain ${chains[idx].chainId}`, built.mmcif);
+  let html = '';
+  if (chains.length > 1) {
+    html += `Chain <select class="tpl-chain">${chains.map((c, i) =>
+      `<option value="${i}"${i === idx ? ' selected' : ''}>${esc(c.chainId)} (${c.sequence.length})</option>`).join('')}</select> · `;
+  }
+  if (card._seq) {
+    const { alignedA, alignedB } = needlemanWunsch(card._seq, built.sequence);
+    const map = alignmentToMapping(alignedA, alignedB);
+    el.querySelector('.tpl-q').value = formatRanges(map.queryIndices);
+    el.querySelector('.tpl-t').value = formatRanges(map.templateIndices);
+    html += `${map.queryIndices.length} residues aligned · ${(map.identity * 100).toFixed(0)}% identical`;
   } else {
-    ta.classList.remove('invalid');
-    ta.classList.add('valid');
-    if (valMsg) valMsg.textContent = '';
+    html += 'Add the chain sequence, then upload again to align';
   }
+  optMsg(msg, html);
+  touch();
 }
 
-// ── Sequence ruler ────────────────────────────────────────────────────────────
+// ── Chain menus ──────────────────────────────────────────────────────────────
 
-// How many residues fit per line given the container pixel width
-function _calcSeqLineLen(container) {
-  const w = container.clientWidth;
-  if (!w) return 60;
-  // JetBrains Mono 13px ≈ 7.82px per char; 24px padding; 8 chars for "     1  ".
-  // A couple of safety chars are subtracted on top — better to under-fill a
-  // row slightly than to overflow by a few px and trigger horizontal scroll.
-  const charW      = 7.82;
-  const padChars   = Math.round(24 / charW);
-  const posChars   = 8;  // "     1  "
-  const sepChars   = 2;  // 2 spaces between groups of 10
-  const safetyChars = 3;
-  const available  = Math.floor(w / charW) - padChars - posChars - safetyChars;
-  // Each full group costs 10 chars + 2 spaces separator (except last)
-  // Approximate: available / (10 + sepChars) groups
-  const groups = Math.max(1, Math.floor(available / (10 + sepChars)));
-  return groups * 10;
-}
-
-// Format sequence as grouped, numbered display.
-// xlHighlights: Map<pos → { color, info }>
-// modHighlights: Map<pos → { type: 'valid'|'selected', ccd, targetAA }>
-function _formatSeqHTML(raw, lineLen, xlHighlights, modHighlights) {
-  const seq = raw.replace(/[^A-Za-z]/g, '').toUpperCase();
-  if (!seq) return '';
-  lineLen = lineLen || 60;
-  const hl    = xlHighlights  || new Map();
-  const modHL = modHighlights || new Map();
-
-  const rows = [];
-  for (let i = 0; i < seq.length; i += lineLen) {
-    const posLabel = String(i + 1).padStart(6);
-    const chunk    = seq.slice(i, i + lineLen);
-    const groups   = [];
-    for (let j = 0; j < chunk.length; j += 10) {
-      let groupHtml = '';
-      for (let k = 0; k < 10; k++) {
-        if (j + k >= chunk.length) break;
-        const absPos = i + j + k + 1;
-        const aa     = chunk[j + k];
-        const hlInfo = hl.get(absPos);
-        const modInfo = modHL.get(absPos);
-        if (hlInfo) {
-          const info = hlInfo.info.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
-          groupHtml += `<span class="seq-res xl-hl" data-pos="${absPos}" data-xl-info="${info}" style="--hl-color:${hlInfo.color}">${aa}</span>`;
-        } else if (modInfo) {
-          const cls  = modInfo.type === 'selected' ? 'mod-selected' : 'mod-valid';
-          const info = modInfo.type === 'selected'
-            ? `${modInfo.name} (${modInfo.ccd}) @ ${absPos}`
-            : `${modInfo.name} (${modInfo.ccd}) — ${modInfo.targetAA} @ ${absPos}`;
-          groupHtml += `<span class="seq-res ${cls}" data-pos="${absPos}" data-mod-info="${info}" style="--mod-color:${modInfo.color}">${aa}</span>`;
-        } else {
-          groupHtml += `<span class="seq-res" data-pos="${absPos}">${aa}</span>`;
-        }
-      }
-      groups.push(groupHtml);
-    }
-    rows.push(`<span class="seq-pos">${posLabel}</span>  ${groups.join('  ')}`);
+function openChainMenu(card, anchor) {
+  const type = card.dataset.type;
+  const items = [];
+  if (type !== 'ligand') {
+    items.push({ label: 'Modification', hint: type === 'protein' ? 'Phospho, methyl, …' : 'Modified base', onClick: () => startMod(card) });
+    if (type !== 'dna') items.push({ label: 'MSA', hint: 'None or your own', onClick: () => { setMode(card, 'msa', card.dataset.msa || 'auto', true); reveal(card.querySelector('.opt-msa')); } });
+    if (type === 'protein') items.push({ label: 'Templates', hint: 'None or your own', onClick: () => { setMode(card, 'tpl', card.dataset.tpl || 'auto', true); reveal(card.querySelector('.opt-tpl')); } });
+    if (card._seq) items.push({ label: card.classList.contains('tall') ? 'Collapse sequence' : 'Show whole sequence', onClick: () => { card.classList.toggle('tall'); } });
+    items.push({ sep: true });
   }
-  return rows.join('\n');
+  items.push({ label: 'Duplicate', onClick: () => duplicateChain(card) });
+  openMenu(anchor, items, { align: 'right' });
 }
 
-// Assign a unique color to every individual XL pair (global index across all groups).
-function _buildPairColorMap() {
-  const map = new Map();
-  let idx = 0;
-  document.querySelectorAll('.xl-group-card').forEach(card => {
-    card.querySelectorAll('.xl-pair-row').forEach(row => {
-      const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-      const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || null;
-      const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-      const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || null;
-      if (c1 && p1 && c2 && p2) {
-        map.set(`${c1}:${p1}:${c2}:${p2}`, XL_GROUP_COLORS[idx % XL_GROUP_COLORS.length]);
-        idx++;
-      }
-    });
+function openTypeMenu(card, anchor) {
+  openMenu(anchor, ['protein', 'rna', 'dna'].map(t => ({
+    label: TYPE_LABEL[t],
+    checked: card.dataset.type === t,
+    onClick: () => { card._guess = false; setType(card, t); refreshChainSels(); touch(); },
+  })));
+}
+
+function startMod(card) {
+  if (!card._seq) { toast('Add the sequence first'); return; }
+  openPtm(card, null);
+}
+
+// ─── Chain references in rows ────────────────────────────────────────────────
+
+const chainSel = (cls, value, only = '') =>
+  `<select class="chain-sel ${cls}" data-v="${esc(value || '')}" data-only="${only}" aria-label="Chain"></select>`;
+
+/** Rebuild the options of every chain <select>, keeping the chosen chain. */
+function refreshChainSels(root = document) {
+  const chains = chainCards().map(c => ({ id: cardId(c), type: c.dataset.type }));
+  root.querySelectorAll('select.chain-sel').forEach(sel => {
+    const only = sel.dataset.only;
+    const ids = [...new Set(chains.filter(c => c.id && (!only || c.type === only)).map(c => c.id))];
+    let v = sel.dataset.v || '';
+    if (!v) v = ids[0] || '';
+    let html = ids.map(id => `<option>${esc(id)}</option>`).join('');
+    if (v && !ids.includes(v)) html += `<option class="missing">${esc(v)}</option>`;
+    if (!html) html = '<option value="">–</option>';
+    sel.innerHTML = html;
+    sel.value = v;
+    sel.dataset.v = v;
   });
-  return map;
 }
 
-// Build a highlight map for a given chain: pos → { color, info } for each XL pair that touches it.
-function _buildXlHighlights(chainId) {
-  const hl         = new Map();
-  const pairColors = _buildPairColorMap();
-  document.querySelectorAll('.xl-group-card').forEach((card, gi) => {
-    const xlName = card.querySelector('.xl-select')?.value || '';
-    card.querySelectorAll('.xl-pair-row').forEach(row => {
-      const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-      const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || null;
-      const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-      const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || null;
-      if (!c1 || !p1 || !c2 || !p2) return;
-      const color    = pairColors.get(`${c1}:${p1}:${c2}:${p2}`) || XL_GROUP_COLORS[gi % XL_GROUP_COLORS.length];
-      const lineInfo = `${xlName}: ${c1}:${p1} ↔ ${c2}:${p2}`;
-      const addHL = pos => {
-        if (!hl.has(pos)) hl.set(pos, { color, info: '' });
-        const e = hl.get(pos);
-        if (!e.info.includes(lineInfo)) e.info = e.info ? e.info + '\n' + lineInfo : lineInfo;
-      };
-      if (c1 === chainId) addHL(p1);
-      if (c2 === chainId) addHL(p2);
-    });
+function renameChainRefs(oldId, newId) {
+  document.querySelectorAll('select.chain-sel').forEach(sel => {
+    if (sel.dataset.v === oldId) sel.dataset.v = newId;
   });
-  return hl;
 }
 
-function _updateRuler(card) {
-  const seqTA   = card.querySelector('.seq-textarea');
-  const display = card.querySelector('.seq-display');
-  if (!seqTA) return;
-
-  const seq = seqTA.value.trim();
-  if (display) {
-    if (seq) {
-      const lineLen  = _calcSeqLineLen(seqTA.parentElement);
-      const chainRaw = card.querySelector('.seq-chain-id')?.value.trim() || '';
-      const chainIds = chainRaw.includes(',')
-        ? chainRaw.split(',').map(s => s.trim()).filter(Boolean)
-        : chainRaw ? [chainRaw] : [];
-      const chainId  = chainIds[0] || '';
-      display.dataset.chainId = chainIds.join(',');
-
-      const xlHL  = chainId ? _buildXlHighlights(chainId) : new Map();
-      const modHL = _buildModHighlights(card.dataset.id);
-      _buildSsPickHighlights(card.dataset.id).forEach((v, k) => { if (!modHL.has(k)) modHL.set(k, v); });
-      display.innerHTML     = _formatSeqHTML(seq, lineLen, xlHL, modHL);
-      display.style.display = 'block';
-      seqTA.style.display   = 'none';
-
-      // Re-apply pending pick highlight if this chain has a pending residue
-      if (_xlPickState && chainIds.includes(_xlPickState.chainId)) {
-        const span = display.querySelector(`.seq-res[data-pos="${_xlPickState.pos}"]`);
-        if (span) { span.classList.add('xl-pick-pending'); _xlPickState.spanEl = span; }
-      }
-    } else {
-      display.style.display = 'none';
-      seqTA.style.display   = 'block';
-      seqTA.style.height    = 'auto';
-      seqTA.style.height    = seqTA.scrollHeight + 'px';
-    }
-  } else {
-    seqTA.style.height = 'auto';
-    seqTA.style.height = seqTA.scrollHeight + 'px';
-  }
-}
-
-// ── XL residue pick (click-to-add-XL) ────────────────────────────────────────
-
-function _toggleXlPickMode() {
-  if (_xlRowPickState) _exitXlRowPickMode();
-  _xlPickMode = !_xlPickMode;
-  const btn      = document.getElementById('selectXlBtn');
-  const seqCont  = document.getElementById('sequences-container');
-  btn?.classList.toggle('xl-pick-mode-on', _xlPickMode);
-  seqCont?.classList.toggle('sequences-xl-pick-active', _xlPickMode);
-  if (!_xlPickMode) _clearPickState();
-  else _updatePickBanner();
-}
-
-// Banner stays visible for the whole time pick mode is on (not just while a
-// residue is pending) so it's always obvious the picker is still active and
-// normal clicks elsewhere in the page won't do what you expect.
-function _updatePickBanner() {
-  const banner = document.getElementById('xl-pick-banner');
-  const textEl = document.getElementById('xl-pick-banner-text');
-  if (!banner || !textEl) return;
-  if (!_xlPickMode) { banner.classList.remove('visible'); return; }
-  textEl.textContent = _xlPickState
-    ? `${_xlPickState.chainId}:${_xlPickState.pos} selected — click a second residue`
-    : 'XL pick mode active — click two residues to add a pair';
-  banner.classList.add('visible');
-}
-
-function _clearPickState() {
-  if (_xlPickState?.spanEl) {
-    try { _xlPickState.spanEl.classList.remove('xl-pick-pending'); } catch {}
-  }
-  _xlPickState = null;
-  _updatePickBanner();
-}
-
-function _closePendingPair() {
-  _xlPendingPair = null;
-  const popup = document.getElementById('xl-confirm-popup');
-  if (popup) popup.style.display = 'none';
-}
-
-function _handleResidueClick(chainId, pos, spanEl) {
-  if (!_xlPickState) {
-    // First residue selected
-    _xlPickState = { chainId, pos, spanEl };
-    spanEl.classList.add('xl-pick-pending');
-    _updatePickBanner();
-  } else if (_xlPickState.chainId === chainId && _xlPickState.pos === pos) {
-    _clearPickState(); // same residue: cancel
-  } else {
-    // Second residue: show confirmation popup
-    const c1 = _xlPickState.chainId, p1 = _xlPickState.pos;
-    const c2 = chainId,             p2 = pos;
-    _clearPickState();
-    _showXlConfirmPopup(c1, p1, c2, p2);
-  }
-}
-
-function _showXlConfirmPopup(c1, p1, c2, p2) {
-  _xlPendingPair = { c1, p1, c2, p2 };
-
-  // Pair label
-  const label = document.getElementById('xl-confirm-pair-label');
-  if (label) label.textContent = `${c1}:${p1}  ↔  ${c2}:${p2}`;
-
-  // Populate existing-group dropdown
-  const groupSel = document.getElementById('xlConfirmGroupSel');
-  if (groupSel) {
-    groupSel.innerHTML = '';
-    const groups = document.querySelectorAll('.xl-group-card');
-    groups.forEach((card, i) => {
-      const name = card.querySelector('.xl-select')?.value || `Group ${i + 1}`;
-      const opt  = document.createElement('option');
-      opt.value       = card.dataset.id;
-      opt.textContent = `Group ${i + 1} — ${name}`;
-      groupSel.appendChild(opt);
-    });
-    const hasGroups = groups.length > 0;
-    groupSel.disabled = !hasGroups;
-
-    // Default mode
-    const modeExisting = document.getElementById('xlModeExisting');
-    const modeNew      = document.getElementById('xlModeNew');
-    if (modeExisting && modeNew) {
-      modeExisting.checked  = hasGroups;
-      modeNew.checked       = !hasGroups;
-      document.getElementById('xlConfirmXlSel').disabled = hasGroups;
-    }
-    if (!hasGroups && modeExisting) modeExisting.disabled = true;
-    else if (modeExisting) modeExisting.disabled = false;
-  }
-
-  // Populate crosslinker dropdown for new group
-  const xlSel = document.getElementById('xlConfirmXlSel');
-  if (xlSel && xlSel.options.length === 0) {
-    CROSSLINKERS.filter(xl => !xl.dynamic).forEach(xl => {
-      const opt = document.createElement('option');
-      opt.value = xl.name;
-      opt.textContent = xl.name;
-      if (xl.name === 'DSSO') opt.selected = true;
-      xlSel.appendChild(opt);
-    });
-  }
-
-  const popup = document.getElementById('xl-confirm-popup');
-  if (popup) popup.style.display = 'block';
-}
-
-function _commitXlFromPopup() {
-  if (!_xlPendingPair) return;
-  const { c1, p1, c2, p2 } = _xlPendingPair;
-  _closePendingPair();
-
-  const modeNew = document.getElementById('xlModeNew')?.checked;
-  let xlCard;
-
-  if (modeNew) {
-    // Create a new XL group
-    const xlName = document.getElementById('xlConfirmXlSel')?.value || 'DSSO';
-    addCrosslinkGroup({ name: xlName });
-    xlCard = document.querySelector('.xl-group-card:last-child');
-  } else {
-    // Use existing group
-    const xlId = document.getElementById('xlConfirmGroupSel')?.value;
-    xlCard = xlId
-      ? document.querySelector(`.xl-group-card[data-id="${xlId}"]`)
-      : document.querySelector('.xl-group-card');
-  }
-
-  if (!xlCard) return;
-  _addXlPair(xlCard, xlCard.dataset.id, { chain1: c1, pos1: p1, chain2: c2, pos2: p2 });
-
-  const newRow = xlCard.querySelector('.xl-pairs-container .xl-pair-row:last-child');
-  if (newRow) {
-    newRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    void newRow.offsetWidth;
-    newRow.classList.add('xl-row-flash');
-  }
-  updateViz();
-}
-
-// ── Template helper ───────────────────────────────────────────────────────────
-
-// ─── Template sequence alignment (query vs. template mmCIF chain) ─────────────
-// Needleman-Wunsch global alignment, used to suggest query/template index
-// mappings from the chain's pasted sequence vs. a template structure's chain.
-
-function _needlemanWunsch(seqA, seqB, match = 2, mismatch = -1, gap = -1) {
-  const n = seqA.length, m = seqB.length;
-  const dp = Array.from({ length: n + 1 }, () => new Float64Array(m + 1));
-  for (let i = 0; i <= n; i++) dp[i][0] = i * gap;
-  for (let j = 0; j <= m; j++) dp[0][j] = j * gap;
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      const s = seqA[i - 1] === seqB[j - 1] ? match : mismatch;
-      dp[i][j] = Math.max(dp[i - 1][j - 1] + s, dp[i - 1][j] + gap, dp[i][j - 1] + gap);
+function onChainIdInput(card, input) {
+  const clean = input.value.toUpperCase().replace(/[^A-Z]/g, '');
+  if (clean !== input.value) input.value = clean;
+  const old = card._id;
+  if (clean && clean !== old) {
+    const taken = chainCards().some(c => c !== card && cardId(c) === clean);
+    const oldShared = chainCards().some(c => c !== card && (c._id === old));
+    if (!taken) {
+      if (old && !oldShared) renameChainRefs(old, clean);
+      card._id = clean;
     }
   }
-  let i = n, j = m, alignedA = '', alignedB = '';
-  while (i > 0 && j > 0) {
-    const s = seqA[i - 1] === seqB[j - 1] ? match : mismatch;
-    if (dp[i][j] === dp[i - 1][j - 1] + s) {
-      alignedA = seqA[i - 1] + alignedA; alignedB = seqB[j - 1] + alignedB; i--; j--;
-    } else if (dp[i][j] === dp[i - 1][j] + gap) {
-      alignedA = seqA[i - 1] + alignedA; alignedB = '-' + alignedB; i--;
-    } else {
-      alignedA = '-' + alignedA; alignedB = seqB[j - 1] + alignedB; j--;
-    }
-  }
-  while (i > 0) { alignedA = seqA[i - 1] + alignedA; alignedB = '-' + alignedB; i--; }
-  while (j > 0) { alignedA = '-' + alignedA; alignedB = seqB[j - 1] + alignedB; j--; }
-  return { alignedA, alignedB };
+  refreshChainSels();
 }
 
-/** 0-based query/template index pairs for every column with a residue on both sides. */
-function _alignmentToMapping(alignedQuery, alignedTemplate) {
-  const queryIndices = [];
-  const templateIndices = [];
-  let qi = 0, ti = 0, nIdentical = 0, nAligned = 0;
-  for (let k = 0; k < alignedQuery.length; k++) {
-    const qc = alignedQuery[k], tc = alignedTemplate[k];
-    if (qc !== '-' && tc !== '-') {
-      queryIndices.push(qi);
-      templateIndices.push(ti);
-      nAligned++;
-      if (qc === tc) nIdentical++;
-      qi++; ti++;
-    } else if (qc === '-') {
-      ti++;
-    } else {
-      qi++;
+// ─── Crosslinks ──────────────────────────────────────────────────────────────
+
+function xlOptionsHTML(selected) {
+  const cats = [...new Set(CROSSLINKERS.map(x => x.category))];
+  let html = '';
+  for (const cat of cats) {
+    html += `<optgroup label="${esc(cat)}">`;
+    for (const x of CROSSLINKERS.filter(c => c.category === cat)) {
+      html += `<option value="${esc(x.name)}"${x.name === selected ? ' selected' : ''}>${esc(x.name)}${x.dynamic ? ' n' : ''}</option>`;
     }
-  }
-  const identity = nAligned ? nIdentical / nAligned : 0;
-  return { queryIndices, templateIndices, identity };
-}
-
-function _addTemplate(card, seqId) {
-  const container = card.querySelector(`.tpl-container[data-seqid="${seqId}"]`);
-  const idx = container.querySelectorAll('.tpl-entry').length;
-
-  const div = document.createElement('div');
-  div.className = 'tpl-entry subsection';
-  div.innerHTML = `
-    <div class="tpl-entry-header">
-      <span class="tpl-entry-title">Template ${idx + 1}</span>
-      <button class="btn-icon remove-tpl-btn" title="Remove template">✕</button>
-    </div>
-    <p class="adv-hint tpl-entry-intro">
-      A template needs a single-chain structure (mmCIF) plus a 0-based mapping between
-      this chain's sequence and the template's residues. If you already have a prepared
-      mapping, use <strong>Upload mapping file</strong> below. Otherwise, pasting or
-      uploading the mmCIF content automatically suggests one — AF3x itself has no tool
-      for this, it only defines the JSON format, so treat the suggestion as a starting
-      point to check, not a guaranteed-correct mapping.
-    </p>
-    <div class="field-row">
-      <div class="field field-grow">
-        <label>mmCIF content</label>
-        <textarea class="tpl-mmcif" rows="2" placeholder="Paste mmCIF, or leave blank and use &quot;Upload &amp; align&quot; below"></textarea>
-      </div>
-      <div class="field field-grow">
-        <label>mmCIF path</label>
-        <input type="text" class="tpl-mmcif-path" placeholder="/path/to/template.cif">
-      </div>
-    </div>
-    <div class="field-row">
-      <div class="field">
-        <label>Query indices (0-based, comma-separated)</label>
-        <input type="text" class="tpl-query-idx" placeholder="0,1,2,5">
-      </div>
-      <div class="field">
-        <label>Template indices (0-based, comma-separated)</label>
-        <input type="text" class="tpl-tpl-idx" placeholder="0,1,2,8">
-      </div>
-      <label class="btn btn-ghost btn-xs tpl-mapping-upload-label"
-             title="Upload a 2-column CSV/TSV file (query_index,template_index per line, one pair per row, 0-based) to fill both index fields above — a local convenience, not an AF3x JSON field">
-        Upload mapping file
-        <input type="file" class="tpl-mapping-file" accept=".csv,.tsv,.txt" style="display:none">
-      </label>
-    </div>
-    <div class="tpl-align-row">
-      <label class="btn btn-outline btn-xs tpl-align-upload-label"
-             title="Upload a PDB or mmCIF file: fills the content field above (converting PDB to mmCIF automatically) and suggests a mapping right away.">
-        Upload &amp; align
-        <input type="file" class="tpl-align-upload-file" accept=".pdb,.ent,.cif,.mmcif,.txt" style="display:none">
-      </label>
-    </div>
-    <p class="adv-hint tpl-align-hint">Pasting or uploading mmCIF content above automatically suggests a mapping below — review it and click Apply.</p>
-    <div class="tpl-align-result" style="display:none"></div>`;
-
-  div.querySelector('.remove-tpl-btn').addEventListener('click', () => {
-    div.remove();
-    _updateAdvancedSummary(seqId);
-  });
-
-  // mmCIF content vs path: mutually exclusive — filling one disables the other
-  const mmcifTa   = div.querySelector('.tpl-mmcif');
-  const mmcifPath = div.querySelector('.tpl-mmcif-path');
-
-  function _syncMmcifExclusivity() {
-    const hasContent = mmcifTa.value.trim().length > 0;
-    const hasPath     = mmcifPath.value.trim().length > 0;
-    mmcifPath.disabled = hasContent;
-    mmcifTa.disabled   = hasPath;
-  }
-  mmcifTa.addEventListener('input', _syncMmcifExclusivity);
-  mmcifPath.addEventListener('input', _syncMmcifExclusivity);
-
-  div.querySelector('.tpl-mapping-file').addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const queries = [];
-      const templates = [];
-      ev.target.result.split(/\r?\n/).forEach(line => {
-        line = line.trim();
-        if (!line) return;
-        const cols = line.split(/[,\t]/).map(s => s.trim());
-        if (cols.length < 2) return;
-        const q = parseInt(cols[0]);
-        const t = parseInt(cols[1]);
-        if (Number.isNaN(q) || Number.isNaN(t)) return; // skip header / bad rows
-        queries.push(q);
-        templates.push(t);
-      });
-      if (!queries.length) {
-        alert('Could not find any valid "query_index,template_index" rows in this file.');
-        return;
-      }
-      div.querySelector('.tpl-query-idx').value = queries.join(',');
-      div.querySelector('.tpl-tpl-idx').value   = templates.join(',');
-    };
-    reader.readAsText(file);
-    e.target.value = '';
-  });
-
-  // Sequence alignment → suggest query/template indices
-  const alignResult = div.querySelector('.tpl-align-result');
-
-  const _runTplAlignment = (templateChain) => {
-    const querySeq = card.querySelector('.seq-textarea')?.value.trim().replace(/\s+/g, '').toUpperCase() || '';
-    const { alignedA, alignedB } = _needlemanWunsch(querySeq, templateChain.sequence);
-    const { queryIndices, templateIndices, identity } = _alignmentToMapping(alignedA, alignedB);
-    if (!queryIndices.length) {
-      alignResult.innerHTML = `<p class="adv-hint" style="color:var(--danger)">No alignable positions found between this chain's sequence and the template.</p>`;
-      alignResult.style.display = '';
-      return;
-    }
-    alignResult.innerHTML = `
-      <p class="adv-hint">
-        Aligned against chain ${templateChain.chainId} (${templateChain.sequence.length} aa) —
-        ${queryIndices.length} mapped position${queryIndices.length === 1 ? '' : 's'},
-        ${(identity * 100).toFixed(0)}% identity over the aligned region.
-      </p>
-      <button class="btn btn-primary btn-xs tpl-apply-align-btn" type="button">Apply mapping (${queryIndices.length} pairs)</button>`;
-    alignResult.style.display = '';
-    alignResult.querySelector('.tpl-apply-align-btn').addEventListener('click', () => {
-      div.querySelector('.tpl-query-idx').value = queryIndices.join(',');
-      div.querySelector('.tpl-tpl-idx').value   = templateIndices.join(',');
-    });
-  };
-
-  const _startAlignmentFromText = (structText, { silent = false } = {}) => {
-    if (!structText.trim()) {
-      if (!silent) alert('No mmCIF content above yet — paste/upload it there first, or use "Upload & align" below.');
-      return;
-    }
-    const querySeq = card.querySelector('.seq-textarea')?.value.trim().replace(/\s+/g, '') || '';
-    if (!querySeq) {
-      if (!silent) alert('This chain has no sequence yet — add one in the Sequence field above first.');
-      return;
-    }
-
-    let chains;
-    try {
-      chains = extractAtomSequences(structText);
-    } catch (e) {
-      if (!silent) alert('Could not parse this structure file: ' + e.message);
-      return;
-    }
-    // Keep chains that look like protein (mostly standard amino acids, not
-    // nucleic acid/unrecognized residues, which extractAtomSequences maps to 'X')
-    const proteinChains = chains.filter(c => {
-      if (!c.sequence) return false;
-      const nUnknown = (c.sequence.match(/X/g) || []).length;
-      return nUnknown / c.sequence.length < 0.5;
-    });
-    if (!proteinChains.length) {
-      if (silent) { alignResult.style.display = 'none'; return; }
-      alignResult.innerHTML = `<p class="adv-hint" style="color:var(--danger)">No protein chains with a sequence found in this structure file.</p>`;
-      alignResult.style.display = '';
-      return;
-    }
-
-    if (proteinChains.length === 1) {
-      _runTplAlignment(proteinChains[0]);
-    } else {
-      const options = proteinChains
-        .map((c, i) => `<option value="${i}">Chain ${c.chainId} (${c.sequence.length} aa)</option>`)
-        .join('');
-      alignResult.innerHTML = `
-        <div class="tpl-chain-pick-row">
-          <label>Multiple protein chains found — pick one:</label>
-          <select class="tpl-chain-pick-sel">${options}</select>
-          <button class="btn btn-outline btn-xs tpl-chain-pick-confirm" type="button">Align</button>
-        </div>`;
-      alignResult.style.display = '';
-      alignResult.querySelector('.tpl-chain-pick-confirm').addEventListener('click', () => {
-        const idx = parseInt(alignResult.querySelector('.tpl-chain-pick-sel').value);
-        _runTplAlignment(proteinChains[idx]);
-      });
-    }
-  };
-
-  // Auto-suggest a mapping whenever the mmCIF content changes (paste/typing),
-  // debounced so it doesn't re-run on every keystroke. Silent: no alerts if a
-  // prerequisite (sequence, parseable content) isn't there yet — it just waits.
-  let _alignDebounceTimer = null;
-  mmcifTa.addEventListener('input', () => {
-    clearTimeout(_alignDebounceTimer);
-    _alignDebounceTimer = setTimeout(() => {
-      _startAlignmentFromText(mmcifTa.value, { silent: true });
-    }, 500);
-  });
-
-  div.querySelector('.tpl-align-upload-file').addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const text = ev.target.result;
-      // Also fill the content field above with this file (converting legacy
-      // PDB to mmCIF first, since that's what AF3x's templates require) —
-      // that's exactly what's needed for the JSON anyway, no reason to make
-      // the user upload the same file twice via two different buttons.
-      if (!mmcifTa.disabled) {
-        try {
-          mmcifTa.value = isMmcifText(text) ? text : pdbToMmcif(text, file.name.replace(/\.[^.]+$/, ''));
-          _syncMmcifExclusivity();
-        } catch { /* fall through to alignment below using the raw text */ }
-      }
-      _startAlignmentFromText(text);
-    };
-    reader.readAsText(file);
-    e.target.value = '';
-  });
-
-  container.appendChild(div);
-  _updateAdvancedSummary(seqId);
-}
-
-// ─── Crosslink Groups ─────────────────────────────────────────────────────────
-
-export function addCrosslinkGroup(preset = null) {
-  _xlCounter++;
-  const id    = `xl_${_xlCounter}`;
-  const color = XL_GROUP_COLORS[(_xlCounter - 1) % XL_GROUP_COLORS.length];
-
-  const card = document.createElement('div');
-  card.className  = 'xl-group-card';
-  card.dataset.id = id;
-  card.style.setProperty('--xl-color', color);
-
-  const defaultName = preset ? preset.name : 'DSSO';
-
-  card.innerHTML = `
-    <div class="xl-group-header">
-      <div class="xl-color-dot" style="background:${color}"></div>
-      <div class="field field-grow">
-        <label>Crosslinker</label>
-        ${_crosslinkerSelect(id, defaultName)}
-      </div>
-      <button class="btn-icon btn-remove-xl" data-xlid="${id}" title="Remove group">✕</button>
-    </div>
-
-    <div class="xl-asym-warning" data-xlid="${id}" style="display:none"></div>
-
-    <div class="xl-dynamic-n" data-xlid="${id}" style="display:none">
-      <label>n (chain length) <input type="number" class="xl-dyn-n-input" value="5" min="1" max="30"></label>
-    </div>
-
-    <div class="xl-pairs-container" data-xlid="${id}"></div>
-
-    <div class="xl-pair-actions">
-      <button class="btn btn-outline btn-sm add-pair-btn" data-xlid="${id}">+ Add pair</button>
-    </div>`;
-
-  card.querySelector('.btn-remove-xl').addEventListener('click', () => {
-    card.remove();
-    updateViz();
-  });
-
-  card.querySelector('.add-pair-btn').addEventListener('click', () => {
-    _addXlPair(card, id);
-  });
-
-  const xlSel = card.querySelector('.xl-select');
-  xlSel.addEventListener('change', () => _handleXlSelectChange(card, id, xlSel.value));
-
-  document.getElementById('crosslinks-container').appendChild(card);
-
-  // Add one pair by default
-  if (preset && preset.pairs) {
-    preset.pairs.forEach(p => _addXlPair(card, id, p));
-  } else {
-    _addXlPair(card, id);
-  }
-
-  updateViz();
-}
-
-function _crosslinkerSelect(id, defaultValue = 'DSSO') {
-  let html = `<select class="xl-select" data-xlid="${id}">`;
-
-  // Group by category
-  const categories = [...new Set(CROSSLINKERS.map(x => x.category))];
-  categories.forEach(cat => {
-    html += `<optgroup label="${cat}">`;
-    CROSSLINKERS.filter(x => x.category === cat).forEach(xl => {
-      const label = xl.symmetric === false ? `${xl.name} ⚠` : xl.name;
-      const sel   = xl.name === defaultValue ? ' selected' : '';
-      html += `<option value="${xl.name}"${sel}>${label}</option>`;
-    });
     html += '</optgroup>';
-  });
-  html += '</select>';
+  }
+  if (selected && !CROSSLINKERS.some(x => x.name === selected)) {
+    html += `<option value="${esc(selected)}" selected>${esc(selected)}</option>`;
+  }
   return html;
 }
 
-function _handleXlSelectChange(card, id, xlName) {
-  const xl     = CROSSLINKERS.find(x => x.name === xlName);
-  const warnEl = card.querySelector(`.xl-asym-warning[data-xlid="${id}"]`);
-  const dynEl  = card.querySelector(`.xl-dynamic-n[data-xlid="${id}"]`);
+const xlGroups = () => [...$('xlGroups').querySelectorAll('.xl')];
 
-  if (xl && !xl.symmetric && !xl.dynamic) {
-    warnEl.style.display = 'block';
-    warnEl.textContent = `⚠ Asymmetric crosslinker — ${xl.asymmetricNote}`;
-  } else {
-    warnEl.style.display = 'none';
-  }
-
-  if (xl && xl.dynamic) {
-    dynEl.style.display = 'block';
-  } else {
-    dynEl.style.display = 'none';
-  }
-
-  updateViz();
+function groupName(g) {
+  const base = g.querySelector('.xl-name').value;
+  const def = CROSSLINKERS.find(x => x.name === base);
+  return def?.dynamic ? `${base}${parseInt(g.querySelector('.xl-n').value, 10) || 5}` : base;
 }
 
-function _addXlPair(card, xlId, defaults = {}) {
-  const container = card.querySelector(`.xl-pairs-container[data-xlid="${xlId}"]`);
-  const idx       = container.querySelectorAll('.xl-pair-row').length;
-
-  const row = document.createElement('div');
-  row.className = 'xl-pair-row';
-  row.innerHTML = `
-    <span class="pair-num">${idx + 1}</span>
-    <input type="text" class="xl-chain-a" placeholder="Chain" value="${defaults.chain1 || ''}" maxlength="4">
-    <input type="number" class="xl-pos-a" placeholder="Res" value="${defaults.pos1 || ''}" min="1">
-    <span class="pair-sep">↔</span>
-    <input type="text" class="xl-chain-b" placeholder="Chain" value="${defaults.chain2 || ''}" maxlength="4">
-    <input type="number" class="xl-pos-b" placeholder="Res" value="${defaults.pos2 || ''}" min="1">
-    <span class="xl-pos-warn" style="display:none"></span>
-    <span class="xl-chem-warn" style="display:none"></span>
-    <button class="btn-icon xl-row-pick-btn" title="Pick residues by clicking in sequence">${_SS_PICK_SVG}</button>
-    <button class="btn-icon btn-remove-pair" title="Remove pair">✕</button>`;
-
-  row.querySelector('.btn-remove-pair').addEventListener('click', () => {
-    if (_xlRowPickState?.row === row) _exitXlRowPickMode();
-    row.remove();
-    // Re-number
-    container.querySelectorAll('.pair-num').forEach((el, i) => { el.textContent = i + 1; });
-    updateViz();
-  });
-
-  row.querySelector('.xl-row-pick-btn').addEventListener('click', () => _toggleXlRowPickMode(row));
-  row.querySelectorAll('input').forEach(inp => inp.addEventListener('input', updateViz));
-  wireXlPairRowHover(row);
-  container.appendChild(row);
-}
-
-// ─── Disulfide Bonds ──────────────────────────────────────────────────────────
-
-const _SS_PICK_SVG = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-  <circle cx="8" cy="8" r="4.5" stroke="currentColor" stroke-width="1.6"/>
-  <line x1="8" y1="1" x2="8" y2="4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-  <line x1="8" y1="12" x2="8" y2="15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-  <line x1="1" y1="8" x2="4" y2="8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-  <line x1="12" y1="8" x2="15" y2="8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-</svg>`;
-
-function addSsBond() {
-  _ssCounter++;
-  const id = `ss_${_ssCounter}`;
-
-  const container = document.getElementById('ss-bonds-container');
-  const row = document.createElement('div');
-  row.className  = 'ss-pair-row';
-  row.dataset.id = id;
-  row.innerHTML = `
-    <span class="pair-label">S–S</span>
-    <input type="text" class="ss-chain-a" placeholder="Chain" maxlength="4">
-    <input type="number" class="ss-pos-a" placeholder="Cys res" min="1">
-    <span class="pair-sep">↔</span>
-    <input type="text" class="ss-chain-b" placeholder="Chain" maxlength="4">
-    <input type="number" class="ss-pos-b" placeholder="Cys res" min="1">
-    <button class="btn-icon ss-pick-btn" title="Pick two Cys residues in sequence">${_SS_PICK_SVG}</button>
-    <button class="btn-icon btn-remove-pair" title="Remove">✕</button>`;
-
-  row.querySelector('.btn-remove-pair').addEventListener('click', () => {
-    if (_ssPickState?.row === row) _exitSsPickMode();
-    row.remove();
-    updateViz();
-  });
-  row.querySelectorAll('input').forEach(inp => inp.addEventListener('input', updateViz));
-  row.querySelector('.ss-pick-btn').addEventListener('click', () => _toggleSsPickMode(row));
-  container.appendChild(row);
-}
-
-function _toggleSsPickMode(row) {
-  if (_ssPickState?.row === row) { _exitSsPickMode(); return; }
-  _exitSsPickMode();
-  if (_modPickState) _exitModPickMode();
-  _ssPickState = { row, slot: 'a' };
-  row.querySelector('.ss-pick-btn')?.classList.add('ss-pick-active');
-  document.querySelectorAll('.seq-card').forEach(card => _updateRuler(card));
-}
-
-function _exitSsPickMode() {
-  if (!_ssPickState) return;
-  _ssPickState.row.querySelector('.ss-pick-btn')?.classList.remove('ss-pick-active');
-  _ssPickState = null;
-  document.querySelectorAll('.seq-card').forEach(card => _updateRuler(card));
-}
-
-function _toggleXlRowPickMode(row) {
-  if (_xlRowPickState?.row === row) { _exitXlRowPickMode(); return; }
-  _exitXlRowPickMode();
-  if (_ssPickState)  _exitSsPickMode();
-  if (_modPickState) _exitModPickMode();
-  if (_xlPickMode)   _toggleXlPickMode();
-  _xlRowPickState = { row, slot: 'a' };
-  row.querySelector('.xl-row-pick-btn')?.classList.add('xl-row-pick-active');
-  document.getElementById('sequences-container')?.classList.add('sequences-xl-pick-active');
-  const textEl = document.getElementById('xl-pick-banner-text');
-  if (textEl) textEl.textContent = 'Click first residue (END1)';
-  document.getElementById('xl-pick-banner')?.classList.add('visible');
-}
-
-function _exitXlRowPickMode() {
-  if (!_xlRowPickState) return;
-  _xlRowPickState.row.querySelector('.xl-row-pick-btn')?.classList.remove('xl-row-pick-active');
-  _xlRowPickState = null;
-  document.getElementById('sequences-container')?.classList.remove('sequences-xl-pick-active');
-  document.getElementById('xl-pick-banner')?.classList.remove('visible');
-}
-
-function _buildSsPickHighlights(seqId) {
-  const hl = new Map();
-  if (!_ssPickState) return hl;
-  const card     = document.querySelector(`.seq-card[data-id="${seqId}"]`);
-  const chainRaw = card?.querySelector('.seq-chain-id')?.value.trim() || '';
-  const seq      = card?.querySelector('.seq-textarea')?.value.trim().replace(/\s/g,'').toUpperCase() || '';
-  if (!seq || !chainRaw) return hl;
-  const chainIds = chainRaw.split(',').map(s => s.trim()).filter(Boolean);
-  const { row } = _ssPickState;
-  const selA_c = row.querySelector('.ss-chain-a')?.value.trim();
-  const selA_p = parseInt(row.querySelector('.ss-pos-a')?.value) || 0;
-  const selB_c = row.querySelector('.ss-chain-b')?.value.trim();
-  const selB_p = parseInt(row.querySelector('.ss-pos-b')?.value) || 0;
-  for (let i = 0; i < seq.length; i++) {
-    if (seq[i] === 'C') {
-      const pos    = i + 1;
-      const isSel  = (chainIds.includes(selA_c) && selA_p === pos) ||
-                     (chainIds.includes(selB_c) && selB_p === pos);
-      hl.set(pos, { type: isSel ? 'selected' : 'valid', ccd: 'SS', targetAA: 'C',
-                    color: '#f0b400', name: 'Cysteine (S–S)' });
-    }
-  }
-  return hl;
-}
-
-// ─── Bonded Atom Pairs ────────────────────────────────────────────────────────
-
-function addBond() {
-  _bondCounter++;
-  const id = `bond_${_bondCounter}`;
-
-  const container = document.getElementById('bonds-container');
-  const div = document.createElement('div');
-  div.className = 'bond-pair-row';
-  div.dataset.id = id;
-  div.innerHTML = `
-    <span class="pair-num bond-num">${_bondCounter}</span>
-    <input type="text"   class="bond-entity-a" placeholder="Chain" maxlength="4">
-    <input type="number" class="bond-res-a"    placeholder="Res"   min="1">
-    <input type="text"   class="bond-atom-a"   placeholder="Atom"  maxlength="8">
-    <span class="bond-connector">—</span>
-    <input type="text"   class="bond-entity-b" placeholder="Chain" maxlength="4">
-    <input type="number" class="bond-res-b"    placeholder="Res"   min="1">
-    <input type="text"   class="bond-atom-b"   placeholder="Atom"  maxlength="8">
-    <button class="btn-icon btn-remove-pair" title="Remove">✕</button>`;
-
-  div.querySelector('.btn-remove-pair').addEventListener('click', () => div.remove());
-  container.appendChild(div);
-}
-
-// ─── PTM Picker ───────────────────────────────────────────────────────────────
-
-function _initPTMModal() {
-  const modal    = document.getElementById('ptm-modal');
-  const closeBtn = document.getElementById('ptmModalClose');
-  const search   = document.getElementById('ptmSearch');
-  const tabs     = document.getElementById('ptmCategoryTabs');
-  const list     = document.getElementById('ptmList');
-
-  // Build category tabs
-  let activeCategory = 'all';
-  const allCategories = ['all', ...PTM_CATEGORIES];
-
-  allCategories.forEach(cat => {
-    const btn = document.createElement('button');
-    btn.className  = 'cat-tab-btn' + (cat === 'all' ? ' active' : '');
-    btn.textContent = cat === 'all' ? 'All' : cat;
-    btn.dataset.cat = cat;
-    btn.addEventListener('click', () => {
-      tabs.querySelectorAll('.cat-tab-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      activeCategory = cat;
-      _renderPTMList(list, search.value, activeCategory);
-    });
-    tabs.appendChild(btn);
-  });
-
-  search.addEventListener('input', () => _renderPTMList(list, search.value, activeCategory));
-  closeBtn.addEventListener('click', () => { modal.style.display = 'none'; });
-  modal.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
-}
-
-function _renderPTMList(list, query, category) {
-  const q = query.toLowerCase();
-  const filtered = PTM_DATABASE.filter(p => {
-    const matchCat  = category === 'all' || p.category === category;
-    const matchQ    = !q || p.ccd.toLowerCase().includes(q) ||
-                      p.name.toLowerCase().includes(q) ||
-                      p.description.toLowerCase().includes(q);
-    return matchCat && matchQ;
-  });
-
-  list.innerHTML = '';
-  if (!filtered.length) {
-    list.innerHTML = '<div class="ptm-empty">No modifications match your search.</div>';
-    return;
-  }
-
-  filtered.forEach(ptm => {
-    const item = document.createElement('div');
-    item.className  = 'ptm-item';
-    item.innerHTML  = `
-      <div class="ptm-ccd">${ptm.ccd}</div>
-      <div class="ptm-info">
-        <span class="ptm-name">${ptm.name}</span>
-        <span class="ptm-aa">→ ${ptm.targetAA}</span>
-        <span class="ptm-desc">${ptm.description}</span>
-      </div>`;
-    item.addEventListener('click', () => _applyPTM(ptm));
-    list.appendChild(item);
-  });
-}
-
-function _openPTMPicker(seqId, existingModEl) {
-  _ptmContext = { seqId, existingModEl };
-  const search = document.getElementById('ptmSearch');
-  search.value = '';
-  _renderPTMList(document.getElementById('ptmList'), '', 'all');
-  document.getElementById('ptm-modal').style.display = 'flex';
-  search.focus();
-}
-
-function _applyPTM(ptm) {
-  if (!_ptmContext) return;
-  const { seqId, existingModEl } = _ptmContext;
-
-  const card   = document.querySelector(`.seq-card[data-id="${seqId}"]`);
-  const modsEl = card?.querySelector(`.mods-container[data-seqid="${seqId}"]`);
-  if (!modsEl) return;
-
-  let row, posEl;
-  if (existingModEl?.classList.contains('mod-row')) {
-    // Update existing row's CCD in place
-    row    = existingModEl;
-    const ccdEl  = row.querySelector('.mod-ccd');
-    posEl  = row.querySelector('.mod-pos');
-    const warnEl = row.querySelector('.mod-pos-warn');
-    if (ccdEl) ccdEl.value = ptm.ccd;
-    _validateModRow(ptm.ccd, posEl?.value || '', seqId, warnEl);
-    _updateRuler(card);
-    _refreshModRowColors(seqId);
-  } else {
-    row   = _addModRow(modsEl, seqId, ptm.ccd, null);
-    posEl = row.querySelector('.mod-pos');
-  }
-
-  // No position chosen yet — go straight into pick mode so valid residues
-  // for this modification's target amino acid are highlighted right away.
-  if (!posEl?.value) _toggleModResiduePickMode(seqId, row);
-  document.getElementById('ptm-modal').style.display = 'none';
-}
-
-function _addModRow(container, seqId, ccdCode = '', position = '') {
-  const row = document.createElement('div');
-  row.className = 'mod-row subsection';
-  row.innerHTML = `
-    <div class="mod-row-main">
-      <input type="text" class="mod-ccd" value="${ccdCode}" placeholder="CCD code (e.g. SEP)"
-             title="Click ⋯ to pick from database">
-      <span class="mod-sep">@</span>
-      <input type="number" class="mod-pos" value="${position}" placeholder="pos" min="1">
-      <button class="btn-icon mod-res-pick-btn" title="Click a residue in the sequence to set position">
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-          <circle cx="8" cy="8" r="4.5" stroke="currentColor" stroke-width="1.6"/>
-          <line x1="8" y1="1" x2="8" y2="4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-          <line x1="8" y1="12" x2="8" y2="15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-          <line x1="1" y1="8" x2="4" y2="8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-          <line x1="12" y1="8" x2="15" y2="8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-        </svg>
-      </button>
-      <button class="btn-icon mod-pick-btn" title="Pick modification from database">⋯</button>
-      <button class="btn-icon btn-remove-pair" title="Remove">✕</button>
+/** d: { name: 'DSSO' | 'LINK5', pairs: [{ c1, p1, c2, p2 }] } */
+function addXlGroup(d = {}) {
+  const found = d.name ? findXl(d.name) : null;
+  const base = found ? found.def.name : (d.name || 'DSSO');
+  const g = document.createElement('div');
+  g.className = 'xl';
+  g.dataset.uid = `x${++uid}`;
+  g.innerHTML = `
+    <div class="xl-head">
+      <span class="dot"></span>
+      <select class="xl-name" aria-label="Crosslinker">${xlOptionsHTML(base)}</select>
+      <input type="number" class="xl-n" min="1" max="30" value="${found?.n || 5}" title="n" aria-label="n" hidden>
+      <span class="xl-info"></span>
+      <span class="xl-count"></span>
+      <button class="icon-btn xl-del" title="Remove crosslinker" aria-label="Remove crosslinker">×</button>
     </div>
-    <div class="mod-pos-warn" style="display:none"></div>`;
+    <div class="rows xl-pairs"></div>
+    <div class="add-row"><button class="btn add sm xl-add">+ Pair</button></div>`;
+  $('xlGroups').appendChild(g);
+  syncXlHead(g);
+  const pairs = d.pairs || [{}];
+  pairs.forEach(p => addXlPair(g, p, false));
+  refreshChainSels(g);
+  activeXl = g;
+  touch();
+  return g;
+}
 
-  const ccdEl   = row.querySelector('.mod-ccd');
-  const posEl   = row.querySelector('.mod-pos');
-  const warnEl  = row.querySelector('.mod-pos-warn');
+function syncXlHead(g) {
+  const def = CROSSLINKERS.find(x => x.name === g.querySelector('.xl-name').value);
+  g.querySelector('.xl-n').hidden = !def?.dynamic;
+  let info = '';
+  if (def?.dynamic) info = def.name === 'LINK' ? 'carbons · any residue' : 'rings · any residue';
+  else if (def?.symmetric) info = def.reactiveResidues.join(' ');
+  else if (def) info = `${def.reactiveResidues[0].join(' ')} → any`;
+  const el = g.querySelector('.xl-info');
+  el.textContent = info;
+  el.title = def ? def.description + (def.symmetric === false ? '. First residue: NHS-ester end.' : '') : '';
+}
 
-  const revalidate = () => {
-    _validateModRow(ccdEl.value, posEl.value, seqId, warnEl);
-    _updateRuler(document.querySelector(`.seq-card[data-id="${seqId}"]`));
-    _refreshModRowColors(seqId);
-  };
-
-  ccdEl.addEventListener('change', revalidate);
-  posEl.addEventListener('input',  () => {
-    // Typing a position by hand supersedes click-to-pick — drop out of pick mode.
-    if (_modPickState?.row === row) _exitModPickMode();
-    _validateModRow(ccdEl.value, posEl.value, seqId, warnEl);
-  });
-  posEl.addEventListener('change', revalidate);
-
-  row.querySelector('.btn-remove-pair').addEventListener('click', () => {
-    if (_modPickState?.row === row) _exitModPickMode();
-    row.remove();
-    _updateRuler(document.querySelector(`.seq-card[data-id="${seqId}"]`));
-    _updateAdvancedSummary(seqId);
-    _refreshModRowColors(seqId);
-  });
-  row.querySelector('.mod-pick-btn').addEventListener('click', () => _openPTMPicker(seqId, row));
-  row.querySelector('.mod-res-pick-btn').addEventListener('click', () => _toggleModResiduePickMode(seqId, row));
-
-  container.appendChild(row);
-  if (ccdCode && position) _validateModRow(ccdCode, position, seqId, warnEl);
-  _updateAdvancedSummary(seqId);
-  _refreshModRowColors(seqId);
+function addXlPair(g, p = {}, refreshSels = true) {
+  const rows = g.querySelector('.xl-pairs');
+  const prev = rows.lastElementChild;
+  const proteins = chainCards().filter(c => c.dataset.type === 'protein').map(cardId);
+  const c1 = p.c1 || prev?.querySelector('.c1').dataset.v || proteins[0] || '';
+  const c2 = p.c2 || prev?.querySelector('.c2').dataset.v || proteins[1] || proteins[0] || '';
+  const row = document.createElement('div');
+  row.className = 'row pair';
+  row.dataset.pid = `p${++uid}`;
+  row.innerHTML = `
+    ${chainSel('c1', c1, 'protein')}<input type="number" class="pos p1" min="1" placeholder="res" value="${p.p1 || ''}" aria-label="Residue"><span class="aa a1"></span>
+    <span class="link"></span>
+    ${chainSel('c2', c2, 'protein')}<input type="number" class="pos p2" min="1" placeholder="res" value="${p.p2 || ''}" aria-label="Residue"><span class="aa a2"></span>
+    <span class="row-msg"></span>
+    <button class="icon-btn row-x" title="Remove" aria-label="Remove">×</button>`;
+  rows.appendChild(row);
+  if (refreshSels) { refreshChainSels(row); touch(); }
   return row;
 }
 
-function _validateModRow(ccdRaw, posRaw, seqId, warnEl) {
-  if (!warnEl) return;
-  const ccd = (ccdRaw || '').trim().toUpperCase();
-  const pos = parseInt(posRaw) || 0;
-  if (!ccd || !pos) { warnEl.style.display = 'none'; return; }
-
-  const card = document.querySelector(`.seq-card[data-id="${seqId}"]`);
-  const seq  = card?.querySelector('.seq-textarea')?.value.trim().replace(/\s/g,'').toUpperCase() || '';
-  if (!seq) { warnEl.style.display = 'none'; return; }
-
-  if (pos > seq.length) {
-    warnEl.textContent = `Position ${pos} out of range (chain length: ${seq.length})`;
-    warnEl.style.display = 'block'; return;
-  }
-  const ptm = PTM_DATABASE.find(p => p.ccd.toUpperCase() === ccd);
-  if (ptm && seq[pos - 1] !== ptm.targetAA) {
-    warnEl.textContent = `${ccd} requires ${ptm.targetAA}, but position ${pos} is ${seq[pos - 1]}`;
-    warnEl.style.display = 'block'; return;
-  }
-  warnEl.style.display = 'none';
-}
-
-function _buildPTMColorMap(seqId) {
-  const map  = new Map();
-  let   idx  = 0;
-  document.querySelector(`.seq-card[data-id="${seqId}"]`)
-    ?.querySelectorAll('.mod-row .mod-ccd').forEach(el => {
-      const ccd = el.value.trim().toUpperCase();
-      if (ccd && !map.has(ccd)) {
-        map.set(ccd, MOD_GROUP_COLORS[idx % MOD_GROUP_COLORS.length]);
-        idx++;
-      }
-    });
-  return map;
-}
-
-// Tints each modification row with the same colour used for its highlight in
-// the sequence display, so the row and the highlighted residue are visually
-// linked at a glance.
-function _refreshModRowColors(seqId) {
-  const colorMap = _buildPTMColorMap(seqId);
-  document.querySelectorAll(`.mods-container[data-seqid="${seqId}"] .mod-row`).forEach(row => {
-    const ccd   = (row.querySelector('.mod-ccd')?.value || '').trim().toUpperCase();
-    const color = ccd ? (colorMap.get(ccd) || MOD_GROUP_COLORS[0]) : null;
-    row.style.setProperty('--mod-row-color', color || 'var(--primary)');
-  });
-}
-
-function _buildModHighlights(seqId) {
-  const hl        = new Map(); // pos → { type, ccd, targetAA, color, name }
-  const card      = document.querySelector(`.seq-card[data-id="${seqId}"]`);
-  const seq       = card?.querySelector('.seq-textarea')?.value.trim().replace(/\s/g,'').toUpperCase() || '';
-  if (!seq) return hl;
-
-  const inPickMode = _modPickState?.seqId === seqId;
-  const pickRow    = inPickMode ? _modPickState.row : null;
-  const colorMap   = _buildPTMColorMap(seqId);
-
-  card.querySelectorAll('.mod-row').forEach(row => {
-    const ccd   = (row.querySelector('.mod-ccd')?.value || '').trim().toUpperCase();
-    const pos   = parseInt(row.querySelector('.mod-pos')?.value) || 0;
-    if (!ccd) return;
-    const ptm   = PTM_DATABASE.find(p => p.ccd.toUpperCase() === ccd);
-    const color = colorMap.get(ccd) || MOD_GROUP_COLORS[0];
-    const name  = ptm ? ptm.name : ccd;
-
-    // In pick mode: highlight all valid positions for the active row
-    if (inPickMode && row === pickRow && ptm) {
-      for (let i = 0; i < seq.length; i++) {
-        if (seq[i] === ptm.targetAA && !hl.has(i + 1)) {
-          hl.set(i + 1, { type: 'valid', ccd, targetAA: ptm.targetAA, color, name });
-        }
-      }
-    }
-    // Always mark the placed position
-    if (pos && pos <= seq.length) {
-      hl.set(pos, { type: 'selected', ccd, targetAA: ptm?.targetAA || '?', color, name });
-    }
-  });
-  return hl;
-}
-
-function _toggleModResiduePickMode(seqId, row) {
-  if (_modPickState?.row === row) { _exitModPickMode(); return; }
-  _exitModPickMode();
-  const ccd = (row.querySelector('.mod-ccd')?.value || '').trim().toUpperCase();
-  const ptm = PTM_DATABASE.find(p => p.ccd.toUpperCase() === ccd);
-  _modPickState = { seqId, row, targetAA: ptm?.targetAA || null };
-  row.querySelector('.mod-res-pick-btn')?.classList.add('mod-pick-active');
-  const card = document.querySelector(`.seq-card[data-id="${seqId}"]`);
-  if (card) _updateRuler(card);
-}
-
-function _exitModPickMode() {
-  if (!_modPickState) return;
-  _modPickState.row.querySelector('.mod-res-pick-btn')?.classList.remove('mod-pick-active');
-  const card = document.querySelector(`.seq-card[data-id="${_modPickState.seqId}"]`);
-  _modPickState = null;
-  if (card) _updateRuler(card);
-}
-
-// ─── Crosslinker Presets ──────────────────────────────────────────────────────
-
-function _initCrosslinkPresets() {
-  const list = document.getElementById('presets-list');
-  const presets = CROSSLINKERS.filter(xl => !xl.dynamic).slice(0, 8);
-
-  presets.forEach(xl => {
-    const btn = document.createElement('button');
-    btn.className   = 'preset-btn';
-    btn.innerHTML   = `<strong>${xl.name}</strong><span>${xl.description}</span>`;
-    btn.addEventListener('click', () => {
-      addCrosslinkGroup({ name: xl.name });
-      document.getElementById('presets-dropdown').style.display = 'none';
-    });
-    list.appendChild(btn);
-  });
-}
-
-function _togglePresetsDropdown() {
-  const dd  = document.getElementById('presets-dropdown');
-  const btn = document.getElementById('crosslinkerPresetsBtn');
-  if (dd.style.display === 'none') {
-    const rect = btn.getBoundingClientRect();
-    dd.style.top  = (btn.offsetTop + btn.offsetHeight + 4) + 'px';
-    dd.style.display = 'block';
+/** Put a pair made by clicking two residues into the active crosslinker. */
+function addClickedPair(p) {
+  let g = activeXl?.isConnected ? activeXl : xlGroups().pop();
+  if (!g) g = addXlGroup({ pairs: [] });
+  const last = g.querySelector('.xl-pairs').lastElementChild;
+  let row;
+  if (last && !last.querySelector('.p1').value && !last.querySelector('.p2').value) {
+    row = last;
+    row.querySelector('.c1').dataset.v = p.c1;
+    row.querySelector('.c2').dataset.v = p.c2;
+    row.querySelector('.p1').value = p.p1;
+    row.querySelector('.p2').value = p.p2;
+    refreshChainSels(row);
   } else {
-    dd.style.display = 'none';
+    row = addXlPair(g, p);
   }
+  flash(row);
+  touch();
 }
 
-// ─── CSV Import handler ───────────────────────────────────────────────────────
-
-function _handleCsvFile(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    openImportModal(ev.target.result, _onCsvImport);
-  };
-  reader.readAsText(file);
-  e.target.value = '';  // reset so same file can be re-selected
-}
-
-function _onCsvImport(pairs, xlName, proteinToChain, sequences = {}) {
-  // Create sequence cards for proteins with fetched sequences (sorted by chain ID)
-  const chainOrder = Object.entries(proteinToChain)
-    .filter(([prot]) => sequences[prot])
-    .sort((a, b) => a[1].localeCompare(b[1]));
-
-  chainOrder.forEach(([prot, chainId]) => {
-    const seq = sequences[prot];
-
-    // Try to reuse an existing card with this chain ID that has no sequence yet
-    let targetCard = null;
-    document.querySelectorAll('.seq-card').forEach(card => {
-      const cid = card.querySelector('.seq-chain-id')?.value.trim();
-      const ta  = card.querySelector('.seq-textarea');
-      if (cid === chainId && ta && !ta.value.trim()) targetCard = card;
-    });
-
-    if (!targetCard) {
-      // Check if chain already has content — skip to avoid overwrite
-      let hasContent = false;
-      document.querySelectorAll('.seq-card').forEach(card => {
-        const cid = card.querySelector('.seq-chain-id')?.value.trim();
-        const ta  = card.querySelector('.seq-textarea');
-        if (cid === chainId && ta && ta.value.trim()) hasContent = true;
-      });
-      if (hasContent) return;
-
-      addSequenceCard('protein');
-      targetCard = document.querySelector('#sequences-container .seq-card:last-child');
-      if (targetCard) targetCard.querySelector('.seq-chain-id').value = chainId;
-    }
-
-    if (!targetCard) return;
-    const ta = targetCard.querySelector('.seq-textarea');
-    if (ta) {
-      ta.value = seq;
-      _autoValidateSeq(ta, 'protein');
-      _updateRuler(targetCard);
-    }
-  });
-
-  // Add crosslink group
-  const converted = pairs.map(p => ({
-    chain1: proteinToChain[p.protein1] || p.protein1,
-    pos1:   p.pos1,
-    chain2: proteinToChain[p.protein2] || p.protein2,
-    pos2:   p.pos2,
-  }));
-  addCrosslinkGroup({ name: xlName, pairs: converted });
-}
-
-// ─── JSON import ──────────────────────────────────────────────────────────────
-
-function _initJsonImport() {
-  // handled via event listener in DOMContentLoaded
-}
-
-function _detectJsonDialect(raw) {
-  if (Array.isArray(raw)) return 'alphafoldserver';
-  if (raw.dialect === 'alphafoldserver') return 'alphafoldserver';
-  if (raw.sequences) return 'af3x';
-  return 'unknown';
-}
-
-function _stripCcd(code) {
-  return typeof code === 'string' ? code.replace(/^CCD_/i, '') : code;
-}
-
-function _convertServerJson(raw) {
-  const jobs = Array.isArray(raw) ? raw : [raw];
-  const job = jobs[0];
-  const w = []; // warnings
-
-  w.push('Converted from AlphaFold Server format.');
-  if (jobs.length > 1) {
-    w.push(`File contains ${jobs.length} jobs — only the first was imported.`);
+/** "A 104 B 43" lines → pairs; null if the text is not a pair list. */
+function parsePairLines(text) {
+  const out = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const m = line.match(/^\W*([A-Za-z]{1,4})\W*?(\d+)\W+([A-Za-z]{1,4})\W*?(\d+)\W*$/);
+    if (!m) return null;
+    out.push({ c1: m[1].toUpperCase(), p1: +m[2], c2: m[3].toUpperCase(), p2: +m[4] });
   }
+  return out.length ? out : null;
+}
 
-  const converted = { name: job.name || '', version: 2 };
+// ─── Disulfides, bonded atoms, custom CCD ────────────────────────────────────
 
-  // Seeds: server uses strings or empty array → default to [1]
-  const rawSeeds = Array.isArray(job.modelSeeds) ? job.modelSeeds : [];
-  converted.modelSeeds = rawSeeds.map(s => parseInt(s, 10)).filter(n => !isNaN(n));
-  if (!converted.modelSeeds.length) converted.modelSeeds = [1];
+function addSs(p = {}) {
+  const proteins = chainCards().filter(c => c.dataset.type === 'protein').map(cardId);
+  const row = document.createElement('div');
+  row.className = 'row ss';
+  row.dataset.pid = `p${++uid}`;
+  row.innerHTML = `
+    ${chainSel('c1', p.c1 || proteins[0], 'protein')}<input type="number" class="pos p1" min="1" placeholder="Cys" value="${p.p1 || ''}" aria-label="Residue"><span class="aa a1"></span>
+    <span class="link"></span>
+    ${chainSel('c2', p.c2 || proteins[0], 'protein')}<input type="number" class="pos p2" min="1" placeholder="Cys" value="${p.p2 || ''}" aria-label="Residue"><span class="aa a2"></span>
+    <span class="row-msg"></span>
+    <button class="icon-btn row-x" title="Remove" aria-label="Remove">×</button>`;
+  $('ssRows').appendChild(row);
+  $('ssSec').hidden = false;
+  refreshChainSels(row);
+  touch();
+  return row;
+}
 
-  const usedIds = new Set();
-  const nextId = () => {
-    for (let i = 0; i < 26; i++) {
-      const c = String.fromCharCode(65 + i);
-      if (!usedIds.has(c)) { usedIds.add(c); return c; }
-    }
-    return '?';
+function addBond(d = {}) {
+  const a = d.a || [], b = d.b || [];
+  const ligand = chainCards().find(c => c.dataset.type === 'ligand');
+  const row = document.createElement('div');
+  row.className = 'row bond';
+  row.innerHTML = `
+    ${chainSel('ca', a[0])}<input type="number" class="pos ra" min="1" placeholder="res" value="${a[1] || ''}" aria-label="Residue"><input type="text" class="atom aa-name" placeholder="atom" value="${esc(a[2] || '')}" maxlength="8" spellcheck="false" aria-label="Atom name">
+    <span class="link"></span>
+    ${chainSel('cb', b[0] || (ligand ? cardId(ligand) : ''))}<input type="number" class="pos rb" min="1" placeholder="res" value="${b[1] || (ligand ? 1 : '')}" aria-label="Residue"><input type="text" class="atom ab-name" placeholder="atom" value="${esc(b[2] || '')}" maxlength="8" spellcheck="false" aria-label="Atom name">
+    <span class="row-msg"></span>
+    <button class="icon-btn row-x" title="Remove" aria-label="Remove">×</button>`;
+  $('bondRows').appendChild(row);
+  $('bondSec').hidden = false;
+  refreshChainSels(row);
+  touch();
+  return row;
+}
+
+function showCcd(content = '', path = '') {
+  $('ccdSec').hidden = false;
+  $('userCCD').value = content;
+  $('userCCDPath').value = path;
+  syncCcd();
+}
+
+function syncCcd() {
+  $('userCCDPath').disabled = !!$('userCCD').value.trim();
+  $('userCCD').disabled = !!$('userCCDPath').value.trim();
+}
+
+// ─── Model ───────────────────────────────────────────────────────────────────
+
+function emptyModel() {
+  return {
+    name: '', version, seedMode: 'count', seedCount: 1, seedList: [],
+    chains: [], xl: [], ss: [], bonds: [], ccd: { content: '', path: '' },
   };
-
-  // Convert modifications array, stripping CCD_ prefix
-  const convertMods = (mods, isProtein) => {
-    if (!Array.isArray(mods) || !mods.length) return undefined;
-    return mods.map(m => isProtein
-      ? { ptmType: _stripCcd(m.ptmType || m.modificationType || ''), ptmPosition: m.ptmPosition || m.basePosition }
-      : { modificationType: _stripCcd(m.modificationType || m.ptmType || ''), basePosition: m.basePosition || m.ptmPosition }
-    );
-  };
-
-  converted.sequences = [];
-  (job.sequences || []).forEach(seqObj => {
-    const type = Object.keys(seqObj)[0];
-    const data = seqObj[type];
-    const count = (Number.isInteger(data.count) && data.count > 0) ? data.count : 1;
-
-    if (type === 'proteinChain') {
-      if (data.useStructureTemplate) w.push('Protein: "useStructureTemplate: true" is not supported and was removed.');
-      if (data.glycans?.length)      w.push('Protein: glycans are not supported in AF3x and were removed.');
-      if (data.maxTemplateDate)      w.push(`Protein: "maxTemplateDate" (${data.maxTemplateDate}) is not supported and was removed.`);
-      if (count > 1 && (data.unpairedMsa || data.templates?.length)) {
-        w.push(`Protein (×${count}): MSA/templates applied to first chain only — add manually to others if needed.`);
-      }
-      const mods = convertMods(data.modifications, true);
-      for (let i = 0; i < count; i++) {
-        const entry = { protein: { id: nextId(), sequence: data.sequence || '' } };
-        if (mods) entry.protein.modifications = mods;
-        if (i === 0 && data.unpairedMsa) entry.protein.unpairedMsa = data.unpairedMsa;
-        if (i === 0 && data.pairedMsa)   entry.protein.pairedMsa   = data.pairedMsa;
-        if (i === 0 && data.templates?.length) entry.protein.templates = data.templates;
-        converted.sequences.push(entry);
-      }
-    } else if (type === 'rnaSequence') {
-      const mods = convertMods(data.modifications, false);
-      for (let i = 0; i < count; i++) {
-        const entry = { rna: { id: nextId(), sequence: data.sequence || '' } };
-        if (mods) entry.rna.modifications = mods;
-        converted.sequences.push(entry);
-      }
-    } else if (type === 'dnaSequence') {
-      const mods = convertMods(data.modifications, false);
-      for (let i = 0; i < count; i++) {
-        const entry = { dna: { id: nextId(), sequence: data.sequence || '' } };
-        if (mods) entry.dna.modifications = mods;
-        converted.sequences.push(entry);
-      }
-    } else if (type === 'ligand') {
-      const ccd = _stripCcd(data.ligand || '');
-      for (let i = 0; i < count; i++) {
-        converted.sequences.push({ ligand: { id: nextId(), ccdCodes: [ccd] } });
-      }
-    } else if (type === 'ion') {
-      w.push(`Ion "${data.ion || type}"${count > 1 ? ` ×${count}` : ''} removed — ions are not supported in AF3x.`);
-    } else {
-      w.push(`Unknown entity type "${type}" was removed.`);
-    }
-  });
-
-  return { converted, warnings: w };
 }
 
-function _openServerImportModal(result) {
-  const modal   = document.getElementById('server-import-modal');
-  const notes   = document.getElementById('serverImportNotes');
-  const options = document.getElementById('serverImportOptions');
-  const msaRow  = document.getElementById('serverImportMsaRow');
-  const tplRow  = document.getElementById('serverImportTplRow');
-  if (!modal) return;
+const intVal = el => parseInt(el.value, 10) || 0;
 
-  // Render notes
-  notes.innerHTML = result.warnings.map((w, i) =>
-    `<span class="${i === 0 ? 'note-converted' : 'note-warn'}">${i === 0 ? 'ℹ' : '⚠'} ${w}</span>`
-  ).join('');
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
-  // Check which optional content exists in converted sequences
-  const hasMsa = result.converted.sequences.some(s => {
-    const d = Object.values(s)[0];
-    return d.unpairedMsa || d.pairedMsa;
-  });
-  const hasTpl = result.converted.sequences.some(s => {
-    const d = Object.values(s)[0];
-    return d.templates?.length > 0;
-  });
+function collect() {
+  const model = emptyModel();
+  const chainColor = cssVar('--chain');
+  const xlColors = XL_GROUP_COLORS[document.documentElement.getAttribute('data-theme')] || XL_GROUP_COLORS.light;
+  model.name = $('jobName').value.trim();
+  model.nameEl = $('jobName');
+  model.seedMode = seedMode;
+  model.seedCount = intVal($('seedCount'));
+  model.seedList = parseIntList($('seedList').value).filter(n => n >= 0 && n <= 4294967295);
+  model.seedEl = seedMode === 'count' ? $('seedCount') : $('seedList');
 
-  options.style.display = (hasMsa || hasTpl) ? '' : 'none';
-  msaRow.style.display  = hasMsa ? '' : 'none';
-  tplRow.style.display  = hasTpl ? '' : 'none';
-  document.getElementById('serverImportMsa').checked = true;
-  document.getElementById('serverImportTpl').checked = true;
-
-  modal._pendingResult = result;
-  modal.style.display  = 'flex';
-}
-
-function _initServerImportModal() {
-  const modal = document.getElementById('server-import-modal');
-  if (!modal) return;
-  const close = () => { modal.style.display = 'none'; modal._pendingResult = null; };
-  document.getElementById('serverImportClose')?.addEventListener('click', close);
-  document.getElementById('serverImportCancel')?.addEventListener('click', close);
-  modal.addEventListener('click', e => { if (e.target === modal) close(); });
-
-  document.getElementById('serverImportConfirm')?.addEventListener('click', () => {
-    const result = modal._pendingResult;
-    if (!result) return;
-    close();
-
-    const includeMsa = document.getElementById('serverImportMsa').checked;
-    const includeTpl = document.getElementById('serverImportTpl').checked;
-
-    // Deep-clone and strip unwanted fields
-    const json = JSON.parse(JSON.stringify(result.converted));
-    if (!includeMsa || !includeTpl) {
-      json.sequences.forEach(s => {
-        const d = Object.values(s)[0];
-        if (!includeMsa) { delete d.unpairedMsa; delete d.pairedMsa; }
-        if (!includeTpl && d.templates?.length > 0) delete d.templates;
-      });
-    }
-
-    const populateWarnings = _populateFromJSON(json);
-    const allWarnings = populateWarnings.filter(Boolean);
-    if (allWarnings.length) {
-      alert('Imported.\n\nNotes:\n• ' + allWarnings.join('\n• '));
-    }
-  });
-}
-
-function _handleJsonImport(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    try {
-      const raw = JSON.parse(ev.target.result);
-      const dialect = _detectJsonDialect(raw);
-
-      if (dialect === 'alphafoldserver') {
-        const result = _convertServerJson(raw);
-        _openServerImportModal(result);
-      } else if (dialect === 'af3x') {
-        const populateWarnings = _populateFromJSON(raw);
-        if (populateWarnings.length) {
-          alert('JSON imported.\n\nNotes:\n• ' + populateWarnings.join('\n• '));
-        } else {
-          alert('JSON imported successfully!');
-        }
-      } else {
-        alert('Unrecognized JSON format. Expected an AF3/AF3x input JSON or an AlphaFold Server job_request.json.');
-      }
-    } catch (err) {
-      alert('Invalid JSON: ' + err.message);
-    }
-  };
-  reader.readAsText(file);
-  e.target.value = '';
-}
-
-function _populateFromJSON(json) {
-  // Clear existing
-  document.getElementById('sequences-container').innerHTML = '';
-  document.getElementById('crosslinks-container').innerHTML = '';
-  document.getElementById('ss-bonds-container').innerHTML = '';
-  document.getElementById('bonds-container').innerHTML = '';
-  _seqCounter = 0; _xlCounter = 0; _ssCounter = 0; _bondCounter = 0;
-
-  // Job settings
-  document.getElementById('jobName').value      = json.name || '';
-  const importedSeeds = json.modelSeeds || [1];
-  document.querySelectorAll('.seed-seg-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.mode === 'specific');
-  });
-  document.getElementById('seedCount').style.display    = 'none';
-  document.getElementById('seedSpecific').style.display = '';
-  document.getElementById('seedSpecific').value         = importedSeeds.join(', ');
-
-  // Restore version from imported JSON
-  const importedVersion = parseInt(json.version, 10);
-  const versionEl = document.getElementById('inputVersion');
-  let versionWarning = null;
-  if (versionEl) {
-    if (importedVersion >= 1 && importedVersion <= 4) {
-      versionEl.value = importedVersion;
-    } else if (json.version !== undefined) {
-      versionEl.value = 4;
-      versionWarning = `Unsupported JSON version "${json.version}" — defaulted to version 4.`;
-    } else {
-      versionEl.value = 4;
-    }
-  }
-
-  // Sequences
-  (json.sequences || []).forEach(seqObj => {
-    const type = Object.keys(seqObj)[0];
-    const data = seqObj[type];
-    addSequenceCard(type);
-
-    const card = document.querySelector('.seq-card:last-child');
-    if (!card) return;
-
-    // Chain ID
-    const chainInput = card.querySelector('.seq-chain-id');
-    if (chainInput) {
-      chainInput.value = Array.isArray(data.id) ? data.id.join(',') : (data.id || '');
-    }
-
-    // Description (optional, purely cosmetic)
-    const descInput = card.querySelector('.seq-description');
-    if (descInput) descInput.value = data.description || '';
-
-    // Sequence
-    const seqTA = card.querySelector('.seq-textarea');
-    if (seqTA && data.sequence) {
-      seqTA.value = data.sequence;
-      _autoValidateSeq(seqTA, type);
-      _updateRuler(card);
-    }
-
-    // Ligand
-    if (type === 'ligand') {
-      if (data.smiles) {
-        card.querySelector('.ligand-smiles').value = data.smiles;
-        card.querySelector('.tab-btn[data-tab="smiles"]')?.click();
-      } else if (data.ccdCodes) {
-        card.querySelector('.ligand-ccd').value = data.ccdCodes.join(',');
-      }
-    }
-
-    // MSA
-    const noMsaCheckEl  = card.querySelector('.no-msa-check');
-    const msaCustomWrap = card.querySelector('.msa-custom-wrap');
-    if (noMsaCheckEl) {
-      const hasMsaFree   = data.unpairedMsa === '' || data.pairedMsa === '';
-      const hasCustomMsa = data.unpairedMsaPath || data.pairedMsaPath || data.unpairedMsa || data.pairedMsa;
-      if (hasMsaFree) {
-        noMsaCheckEl.checked = true;
-        noMsaCheckEl.dispatchEvent(new Event('change'));
-      } else if (hasCustomMsa) {
-        if (msaCustomWrap) msaCustomWrap.style.display = 'block';
-        const unpairedPathEl = card.querySelector('.msa-unpaired-path');
-        const pairedPathEl   = card.querySelector('.msa-paired-path');
-        if (unpairedPathEl) {
-          if (data.unpairedMsaPath) {
-            unpairedPathEl.value = data.unpairedMsaPath;
-          } else if (data.unpairedMsa) {
-            const contentEl = card.querySelector('.msa-unpaired-content');
-            if (contentEl) contentEl.value = data.unpairedMsa;
-            unpairedPathEl.value = '(inline content)';
-            unpairedPathEl.dataset.isUpload = 'true';
-          }
-        }
-        if (pairedPathEl) {
-          if (data.pairedMsaPath) {
-            pairedPathEl.value = data.pairedMsaPath;
-          } else if (data.pairedMsa) {
-            const contentEl = card.querySelector('.msa-paired-content');
-            if (contentEl) contentEl.value = data.pairedMsa;
-            pairedPathEl.value = '(inline content)';
-            pairedPathEl.dataset.isUpload = 'true';
-          }
-        }
-      }
-    }
-
-    // Modifications
-    if (data.modifications?.length) {
-      const modsEl = card.querySelector('.mods-container');
-      data.modifications.forEach(mod => {
-        const code = mod.ptmType || mod.modificationType || '';
-        const pos  = mod.ptmPosition || mod.basePosition || '';
-        if (modsEl) _addModRow(modsEl, card.dataset.id, code, pos);
-      });
-    }
-
-    // "Without templates" — restore if templates: [] was explicitly set
-    if (Array.isArray(data.templates) && data.templates.length === 0) {
-      const noTplCheck = card.querySelector('.no-templates-check');
-      if (noTplCheck) {
-        noTplCheck.checked = true;
-        noTplCheck.dispatchEvent(new Event('change'));
-      }
-    } else if (Array.isArray(data.templates) && data.templates.length > 0) {
-      data.templates.forEach(tpl => {
-        _addTemplate(card, card.dataset.id);
-        const entries = card.querySelectorAll('.tpl-entry');
-        const div = entries[entries.length - 1];
-        const mmcifTa   = div.querySelector('.tpl-mmcif');
-        const mmcifPath = div.querySelector('.tpl-mmcif-path');
-        if (tpl.mmcif && mmcifTa)         { mmcifTa.value   = tpl.mmcif;     if (mmcifPath) mmcifPath.disabled = true; }
-        else if (tpl.mmcifPath && mmcifPath) { mmcifPath.value = tpl.mmcifPath; if (mmcifTa)   mmcifTa.disabled   = true; }
-        if (tpl.queryIndices)    div.querySelector('.tpl-query-idx').value = tpl.queryIndices.join(', ');
-        if (tpl.templateIndices) div.querySelector('.tpl-tpl-idx').value   = tpl.templateIndices.join(', ');
-      });
-    }
-
-    _updateAdvancedSummary(card.dataset.id);
-  });
-
-  // Crosslinks
-  (json.crosslinks || []).forEach(group => {
-    const pairs = (group.residue_pairs || []).map(pair => ({
-      chain1: pair[0][0], pos1: pair[0][1],
-      chain2: pair[1][0], pos2: pair[1][1],
-    }));
-    addCrosslinkGroup({ name: group.name, pairs });
-  });
-
-  // Disulfide bonds
-  (json.disulfide_bonds || []).forEach(ssBond => {
-    (ssBond.residue_pairs || []).forEach(pair => {
-      addSsBond();
-      const row = document.querySelector('.ss-pair-row:last-child');
-      if (row) {
-        row.querySelector('.ss-chain-a').value = pair[0][0];
-        row.querySelector('.ss-pos-a').value   = pair[0][1];
-        row.querySelector('.ss-chain-b').value = pair[1][0];
-        row.querySelector('.ss-pos-b').value   = pair[1][1];
-      }
-    });
-  });
-
-  // Bonded atom pairs
-  (json.bondedAtomPairs || []).forEach(bond => {
-    addBond();
-    const div = document.querySelector('.bond-pair-row:last-child');
-    if (div) {
-      div.querySelector('.bond-entity-a').value = bond[0][0] || '';
-      div.querySelector('.bond-res-a').value    = bond[0][1] || '';
-      div.querySelector('.bond-atom-a').value   = bond[0][2] || '';
-      div.querySelector('.bond-entity-b').value = bond[1][0] || '';
-      div.querySelector('.bond-res-b').value    = bond[1][1] || '';
-      div.querySelector('.bond-atom-b').value   = bond[1][2] || '';
-    }
-  });
-
-  // User CCD
-  document.getElementById('userCCD').value     = json.userCCD || '';
-  document.getElementById('userCCDPath').value = json.userCCDPath || '';
-  _syncUserCcdExclusivity();
-
-  updateViz();
-  return versionWarning ? [versionWarning] : [];
-}
-
-// ─── JSON Generation ──────────────────────────────────────────────────────────
-
-function _fixAsymmetricXlOrder(jsonObj, chainSeqMap) {
-  const notes = [];
-  (jsonObj.crosslinks || []).forEach(group => {
-    const xl = CROSSLINKERS.find(x => group.name === x.name || group.name.startsWith(x.name));
-    if (!xl || xl.symmetric || xl.dynamic) return;
-
-    const end1 = xl.reactiveResidues[0]; // NHS-ester end — must be position 1
-
-    const isEnd1Compatible = (chain, pos) => {
-      if (!end1 || end1.includes('any AA')) return true;
-      const seq = chainSeqMap[chain];
-      if (!seq) return true; // unknown chain — skip
-      const aa = seq[pos - 1];
-      if (!aa) return true;
-      return end1.includes(aa) || (pos === 1 && end1.includes('N-term'));
+  model.chains = chainCards().map(card => {
+    const type = card.dataset.type;
+    const c = {
+      el: card, id: cardId(card), type, seq: card._seq || '', color: chainColor,
+      label: card.querySelector('.chain-label').value.trim(),
+      mods: [],
+      msa: { mode: 'auto', el: card.querySelector('.opt-msa') },
+      tpl: { mode: 'auto', el: card.querySelector('.opt-tpl'), entries: [] },
     };
-
-    (group.residue_pairs || []).forEach((pair, i) => {
-      const [c1, p1] = pair[0];
-      const [c2, p2] = pair[1];
-      if (!isEnd1Compatible(c1, p1) && isEnd1Compatible(c2, p2)) {
-        group.residue_pairs[i] = [[c2, p2], [c1, p1]];
-        const aa1 = chainSeqMap[c1]?.[p1 - 1] || '?';
-        const aa2 = chainSeqMap[c2]?.[p2 - 1] || '?';
-        notes.push(`${group.name}: swapped ${c1}:${aa1}${p1} ↔ ${c2}:${aa2}${p2} — ${aa2}${p2} placed first as NHS-ester (END1) anchor`);
-      }
-    });
-  });
-  return notes;
-}
-
-let _hasGeneratedOnce = false;
-
-function _markOutputStale() {
-  if (!_hasGeneratedOnce) return;
-  const banner = document.getElementById('outputStaleBanner');
-  if (banner) banner.style.display = 'flex';
-  const dl = document.getElementById('downloadJsonLink');
-  if (dl) dl.classList.add('stale-action');
-}
-
-function _clearOutputStale() {
-  const banner = document.getElementById('outputStaleBanner');
-  if (banner) banner.style.display = 'none';
-  const dl = document.getElementById('downloadJsonLink');
-  if (dl) dl.classList.remove('stale-action');
-}
-
-function generateJSON() {
-  try {
-    const output = _buildJSON();
-
-    // Build chainSeqMap for order correction
-    const csMap = {};
-    (output.sequences || []).forEach(entry => {
-      const type = Object.keys(entry)[0];
-      const data = entry[type];
-      if (data.sequence) {
-        const ids = Array.isArray(data.id) ? data.id : [data.id];
-        ids.forEach(id => { csMap[id] = data.sequence; });
-      }
-    });
-
-    // Auto-fix asymmetric XL pair order BEFORE serialising
-    const autoSwaps = _fixAsymmetricXlOrder(output, csMap);
-
-    const pretty = JSON.stringify(output, null, 2);
-
-    const el = document.getElementById('jsonOutput');
-    el.textContent = pretty;
-
-    // Brief flash on re-generate to confirm it ran
-    if (_hasGeneratedOnce) {
-      el.classList.add('output-flash');
-      setTimeout(() => el.classList.remove('output-flash'), 350);
-    }
-    _hasGeneratedOnce = true;
-    _clearOutputStale();
-
-    // Show expand + copy + download
-    document.getElementById('expandJsonBtn').style.display = 'inline-block';
-    document.getElementById('copyJsonBtn').style.display  = 'inline-block';
-    const dl = document.getElementById('downloadJsonLink');
-    dl.href     = 'data:application/json;charset=utf-8,' + encodeURIComponent(pretty);
-    dl.download = (output.name || 'alphafold3_input') + '.json';
-    dl.style.display = 'inline-block';
-
-    // Validate (auto-swaps already applied)
-    const { errors, warnings } = _validateGeneratedJSON(output);
-    _showValidationReport(errors, warnings, autoSwaps);
-
-  } catch (err) {
-    document.getElementById('jsonOutput').textContent = '// Error: ' + err.message;
-    _showValidationReport([err.message], []);
-    console.error(err);
-  }
-}
-
-function _validateGeneratedJSON(jsonObj) {
-  const errors   = [];
-  const warnings = [];
-
-  // Build chain → sequence map and chain → type map from the JSON object itself
-  const chainSeqMap  = {};
-  const chainTypeMap = {};   // id → 'protein' | 'rna' | 'dna' | 'ccd_ligand' | 'smiles_ligand'
-  (jsonObj.sequences || []).forEach(entry => {
-    const type = Object.keys(entry)[0];
-    const data = entry[type];
-    const ids  = Array.isArray(data.id) ? data.id : [data.id];
-    if (data.sequence) ids.forEach(id => { chainSeqMap[id] = data.sequence; });
-    const kind = (type === 'ligand') ? (data.smiles ? 'smiles_ligand' : 'ccd_ligand') : type;
-    ids.forEach(id => { chainTypeMap[id] = kind; });
-  });
-  const knownChains = new Set(Object.keys(chainSeqMap));
-
-  // Validate crosslink groups
-  (jsonObj.crosslinks || []).forEach(group => {
-    const xlName = group.name;
-    const xl     = CROSSLINKERS.find(x => xlName === x.name || xlName.startsWith(x.name));
-
-    (group.residue_pairs || []).forEach(pair => {
-      const [c1, p1] = pair[0];
-      const [c2, p2] = pair[1];
-
-      if (!knownChains.has(c1)) errors.push(`XL "${xlName}": chain "${c1}" is not defined in sequences`);
-      if (!knownChains.has(c2)) errors.push(`XL "${xlName}": chain "${c2}" is not defined in sequences`);
-
-      const seq1 = chainSeqMap[c1];
-      const seq2 = chainSeqMap[c2];
-      if (seq1 && p1 > seq1.length) errors.push(`XL "${xlName}": ${c1}:${p1} out of bounds (chain length ${seq1.length})`);
-      if (seq2 && p2 > seq2.length) errors.push(`XL "${xlName}": ${c2}:${p2} out of bounds (chain length ${seq2.length})`);
-
-      // Chemical compatibility (order already auto-corrected for asymmetric XLs)
-      if (xl && !xl.dynamic && seq1 && seq2) {
-        const r1 = xl.symmetric ? xl.reactiveResidues : xl.reactiveResidues[0];
-        const r2 = xl.symmetric ? xl.reactiveResidues : xl.reactiveResidues[1];
-
-        const chemOk = (seq, pos, reactive) => {
-          if (!reactive || reactive.includes('any AA')) return true;
-          const aa = seq[pos - 1];
-          if (!aa) return true;
-          if (reactive.includes(aa)) return true;
-          if (pos === 1 && reactive.includes('N-term')) return true;
-          return false;
-        };
-
-        const _fmtAllowed = r => {
-          const aas = r.filter(x => x !== 'N-term').join(', ');
-          return r.includes('N-term') ? `${aas} (or N-term)` : aas;
-        };
-        if (!chemOk(seq1, p1, r1)) {
-          const aa = seq1[p1 - 1];
-          const msg = `XL "${xlName}": ${c1}:${aa}${p1} — ${aa} not reactive at END1 position [${_fmtAllowed(r1)}]`;
-          errors.push(msg);
-        }
-        if (!chemOk(seq2, p2, r2)) {
-          const aa = seq2[p2 - 1];
-          const msg = `XL "${xlName}": ${c2}:${aa}${p2} — ${aa} not reactive at END2 position [${_fmtAllowed(r2)}]`;
-          // Only error if the crosslinker actually requires a specific residue at END2
-          const isAnyAA = !r2 || r2.includes('any AA');
-          if (isAnyAA) warnings.push(msg); else errors.push(msg);
-        }
-      }
-    });
-  });
-
-  // Duplicate residue positions across all XL pairs
-  const xlPosUsage = {};
-  (jsonObj.crosslinks || []).forEach(group => {
-    (group.residue_pairs || []).forEach(pair => {
-      const k1 = `${pair[0][0]}:${pair[0][1]}`;
-      const k2 = `${pair[1][0]}:${pair[1][1]}`;
-      xlPosUsage[k1] = (xlPosUsage[k1] || 0) + 1;
-      xlPosUsage[k2] = (xlPosUsage[k2] || 0) + 1;
-    });
-  });
-  Object.entries(xlPosUsage).forEach(([key, count]) => {
-    if (count > 1) errors.push(`Residue ${key} appears in ${count} crosslink pairs — each residue may only be crosslinked once`);
-  });
-
-  // Disulfide bonds
-  (jsonObj.disulfide_bonds || []).forEach(group => {
-    (group.residue_pairs || []).forEach(pair => {
-      const [c1, p1] = pair[0];
-      const [c2, p2] = pair[1];
-      if (!knownChains.has(c1)) errors.push(`S–S bond: chain "${c1}" is not defined`);
-      if (!knownChains.has(c2)) errors.push(`S–S bond: chain "${c2}" is not defined`);
-      // Cysteine check
-      if (chainSeqMap[c1]?.[p1-1] && chainSeqMap[c1][p1-1] !== 'C')
-        warnings.push(`S–S bond: ${c1}:${chainSeqMap[c1][p1-1]}${p1} — expected Cys (C)`);
-      if (chainSeqMap[c2]?.[p2-1] && chainSeqMap[c2][p2-1] !== 'C')
-        warnings.push(`S–S bond: ${c2}:${chainSeqMap[c2][p2-1]}${p2} — expected Cys (C)`);
-    });
-  });
-
-  // Bonded atom pairs — must have at least one CCD-ligand endpoint
-  const POLYMER_TYPES = new Set(['protein', 'rna', 'dna']);
-  (jsonObj.bondedAtomPairs || []).forEach((bond, bi) => {
-    const eA    = bond[0][0];
-    const eB    = bond[1][0];
-    const typeA = chainTypeMap[eA];
-    const typeB = chainTypeMap[eB];
-    const idx   = bi + 1;
-
-    if (typeA === 'smiles_ligand')
-      errors.push(`Bonded atom pair ${idx}: chain "${eA}" is a SMILES ligand — SMILES compounds have no named atoms; use a CCD ligand instead`);
-    if (typeB === 'smiles_ligand')
-      errors.push(`Bonded atom pair ${idx}: chain "${eB}" is a SMILES ligand — SMILES compounds have no named atoms; use a CCD ligand instead`);
-    if (typeA && typeB && POLYMER_TYPES.has(typeA) && POLYMER_TYPES.has(typeB))
-      errors.push(`Bonded atom pair ${idx}: both "${eA}" (${typeA}) and "${eB}" (${typeB}) are polymer chains — at least one endpoint must be a CCD ligand`);
-  });
-
-  return { errors, warnings };
-}
-
-function _showValidationReport(errors, warnings, infos = []) {
-  const panel = document.getElementById('json-validation-panel');
-  if (!panel) return;
-
-  if (errors.length === 0 && warnings.length === 0 && infos.length === 0) {
-    panel.innerHTML = '<div class="val-ok">✓ All checks passed — JSON is valid</div>';
-  } else {
-    let html = '';
-    errors.forEach(e   => { html += `<div class="val-error">✗ ${e}</div>`; });
-    warnings.forEach(w => { html += `<div class="val-warn">⚠ ${w}</div>`; });
-    infos.forEach(i    => { html += `<div class="val-info">↔ ${i}</div>`; });
-    panel.innerHTML = html;
-  }
-  panel.style.display = 'block';
-}
-
-function _buildJSON() {
-  const name    = document.getElementById('jobName').value.trim();
-  const version = parseInt(document.getElementById('inputVersion')?.value || '4', 10) || 4;
-
-  const seedMode = document.querySelector('.seed-seg-btn.active')?.dataset.mode || 'count';
-  let seeds;
-  if (seedMode === 'count') {
-    const n = parseInt(document.getElementById('seedCount')?.value || '1');
-    if (n < 1 || n > 100) throw new Error('Seed count must be between 1 and 100.');
-    seeds = Array.from({ length: n }, (_, i) => i + 1);
-  } else {
-    const raw = document.getElementById('seedSpecific')?.value.trim() || '';
-    seeds = raw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (!seeds.length) throw new Error('At least one model seed is required.');
-  }
-  if (!name) throw new Error('Job name is required.');
-
-  // Field order matches real AF3x JSON files
-  const output = { dialect: 'alphafold3', version, name, modelSeeds: seeds, sequences: [] };
-
-  // ── Sequences ─────────────────────────────────────────────────────────────
-  document.querySelectorAll('.seq-card').forEach(card => {
-    const type    = card.querySelector('.seq-type-label').textContent.toLowerCase();
-    const chainRaw = card.querySelector('.seq-chain-id').value.trim();
-    if (!chainRaw) throw new Error('All sequence entities need a chain ID.');
-
-    const ids = chainRaw.includes(',')
-      ? chainRaw.split(',').map(s => s.trim()).filter(Boolean)
-      : chainRaw;
-
-    const seqData = { id: ids };
-
-    const description = card.querySelector('.seq-description')?.value.trim();
-    if (description) seqData.description = description;
-
     if (type === 'ligand') {
-      const smilesEl = card.querySelector('.ligand-smiles');
-      const ccdEl    = card.querySelector('.ligand-ccd');
-      // Active tab determines which to use
-      const activePanel = card.querySelector('.ligand-body .tab-panel.active');
-      if (activePanel?.dataset.panel === 'smiles') {
-        const smiles = smilesEl?.value.trim();
-        if (!smiles) throw new Error(`Ligand chain "${chainRaw}": SMILES is empty.`);
-        seqData.smiles = smiles;
-      } else {
-        const ccd = ccdEl?.value.trim();
-        if (!ccd) throw new Error(`Ligand chain "${chainRaw}": CCD codes are empty.`);
-        seqData.ccdCodes = ccd.split(',').map(s => s.trim()).filter(Boolean);
-      }
-      output.sequences.push({ ligand: seqData });
-      return;
+      c.ligKind = card.dataset.lig || 'ccd';
+      c.ligValue = card.querySelector('.lig-input').value.trim();
+      return c;
     }
-
-    const seqTA = card.querySelector('.seq-textarea');
-    const seq   = (seqTA?.value || '').trim().replace(/\s/g, '').toUpperCase();
-    if (!seq) throw new Error(`Chain "${chainRaw}": sequence is empty.`);
-    if (type === 'rna' && /[^ACGU]/.test(seq))
-      throw new Error(`Chain "${chainRaw}": RNA sequence may only contain A, C, G, U.`);
-    if (type === 'dna' && /[^ACGT]/.test(seq))
-      throw new Error(`Chain "${chainRaw}": DNA sequence may only contain A, C, G, T.`);
-    seqData.sequence = seq;
-
-    // Modifications
-    const mods = [];
-    card.querySelectorAll('.mod-row').forEach(row => {
-      const code = row.querySelector('.mod-ccd')?.value.trim();
-      const pos  = parseInt(row.querySelector('.mod-pos')?.value) || null;
-      if (code && pos) {
-        if (type === 'protein') mods.push({ ptmType: code, ptmPosition: pos });
-        else                    mods.push({ modificationType: code, basePosition: pos });
-      }
-    });
-    if (mods.length) seqData.modifications = mods;
-
-    // MSA — protein and RNA only; DNA has no MSA support in AF3x spec
-    let msaMode = 'auto';
-    if (type === 'protein' || type === 'rna') {
-      msaMode = _getMsaMode(card);
-
-      if (msaMode === 'none') {
-        seqData.unpairedMsa = '';
-        if (type === 'protein') seqData.pairedMsa = '';
-      } else if (msaMode === 'custom') {
-        const unpairedPathEl    = card.querySelector('.msa-unpaired-path');
-        const unpairedContentEl = card.querySelector('.msa-unpaired-content');
-        const unpairedPath      = unpairedPathEl?.value.trim() || '';
-        const unpairedIsUpload  = unpairedPathEl?.dataset.isUpload === 'true';
-        const unpairedContent   = unpairedContentEl?.value || '';
-
-        if (unpairedIsUpload && unpairedContent.trim()) {
-          seqData.unpairedMsa = unpairedContent;
-        } else if (unpairedPath) {
-          seqData.unpairedMsaPath = unpairedPath;
-        }
-
-        if (type === 'protein') {
-          const pairedPathEl    = card.querySelector('.msa-paired-path');
-          const pairedContentEl = card.querySelector('.msa-paired-content');
-          const pairedPath      = pairedPathEl?.value.trim() || '';
-          const pairedIsUpload  = pairedPathEl?.dataset.isUpload === 'true';
-          const pairedContent   = pairedContentEl?.value || '';
-
-          if (pairedIsUpload && pairedContent.trim()) {
-            seqData.pairedMsa = pairedContent;
-          } else if (pairedPath) {
-            seqData.pairedMsaPath = pairedPath;
-          }
-        }
-      }
-      // 'auto': omit all MSA fields → AF3 generates automatically
-    }
-
-    // Templates
-    const tplEntries = [];
-    card.querySelectorAll('.tpl-entry').forEach(tpl => {
-      const mmcifContent  = tpl.querySelector('.tpl-mmcif')?.value.trim()      || null;
-      const mmcifPath     = tpl.querySelector('.tpl-mmcif-path')?.value.trim() || null;
-      const queryRaw      = tpl.querySelector('.tpl-query-idx')?.value.trim()  || '';
-      const tplRaw        = tpl.querySelector('.tpl-tpl-idx')?.value.trim()    || '';
-
-      if (!queryRaw || !tplRaw)
-        throw new Error(`Template in chain "${chainRaw}": both query and template indices are required.`);
-      if (mmcifContent && mmcifPath)
-        throw new Error(`Template in chain "${chainRaw}": provide mmCIF content OR path, not both.`);
-
-      const entry = {};
-      if (mmcifPath) entry.mmcifPath = mmcifPath;
-      else if (mmcifContent) entry.mmcif = mmcifContent;
-      entry.queryIndices    = queryRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-      entry.templateIndices = tplRaw.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-      if (entry.queryIndices.length !== entry.templateIndices.length)
-        throw new Error(`Template in chain "${chainRaw}": query and template index counts must match.`);
-      tplEntries.push(entry);
-    });
-    const noTpl = card.querySelector('.no-templates-check')?.checked;
-    if (noTpl) {
-      seqData.templates = []; // explicitly disable template search
-    } else if (tplEntries.length) {
-      seqData.templates = tplEntries;
-      // AF3x rejects this combination outright ("templates set only partially"):
-      // custom templates require unpairedMsa/pairedMsa to also be explicit.
-      if (msaMode === 'auto') {
-        throw new Error(
-          `Chain "${chainRaw}": has custom templates but MSA is still on Auto. ` +
-          `AF3x requires MSA to be explicit too — pick "Without MSA" or add a custom MSA for this chain.`
-        );
+    c.mods = [...card.querySelectorAll('.mod-chip')].map(el => ({ el, ccd: el.dataset.ccd, pos: parseInt(el.dataset.pos, 10) }));
+    if (type !== 'dna') {
+      c.msa.mode = card.dataset.msa || 'auto';
+      for (const slot of ['unpaired', 'paired']) {
+        c.msa[slot] = fileVal(card.querySelector(`.file-row[data-slot="${slot}"] .msa-path`));
       }
     }
-
-    output.sequences.push({ [type]: seqData });
-  });
-
-  if (!output.sequences.length) throw new Error('Add at least one sequence entity.');
-
-  // ── Crosslinks ─────────────────────────────────────────────────────────────
-  const xlGroups = [];
-  document.querySelectorAll('.xl-group-card').forEach(card => {
-    const xlId    = card.dataset.id;
-    const xlSel   = card.querySelector('.xl-select');
-    let   xlName  = xlSel?.value || 'DSSO';
-
-    const xl = CROSSLINKERS.find(x => x.name === xlName);
-    if (xl?.dynamic) {
-      const n = parseInt(card.querySelector('.xl-dyn-n-input')?.value) || 5;
-      xlName  = xlName + n;
+    if (type === 'protein') {
+      c.tpl.mode = card.dataset.tpl || 'auto';
+      c.tpl.entries = [...card.querySelectorAll('.tpl')].map(el => {
+        const f = fileVal(el.querySelector('.tpl-path'));
+        return { el, mmcif: f.content, mmcifPath: f.path, q: parseRanges(el.querySelector('.tpl-q').value), t: parseRanges(el.querySelector('.tpl-t').value) };
+      });
     }
-
-    const pairs = [];
-    card.querySelectorAll('.xl-pair-row').forEach(row => {
-      const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-      const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || null;
-      const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-      const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || null;
-      if (c1 && p1 && c2 && p2) pairs.push([[c1, p1], [c2, p2]]);
-    });
-
-    if (pairs.length) xlGroups.push({ name: xlName, residue_pairs: pairs });
+    return c;
   });
-  if (xlGroups.length) output.crosslinks = xlGroups;
 
-  // ── Disulfide bonds ─────────────────────────────────────────────────────────
-  const ssPairs = [];
-  document.querySelectorAll('.ss-pair-row').forEach(row => {
-    const c1 = row.querySelector('.ss-chain-a')?.value.trim();
-    const p1 = parseInt(row.querySelector('.ss-pos-a')?.value) || null;
-    const c2 = row.querySelector('.ss-chain-b')?.value.trim();
-    const p2 = parseInt(row.querySelector('.ss-pos-b')?.value) || null;
-    if (c1 && p1 && c2 && p2) ssPairs.push([[c1, p1], [c2, p2]]);
+  const pairOf = row => ({
+    el: row,
+    c1: row.querySelector('.c1').value, p1: intVal(row.querySelector('.p1')),
+    c2: row.querySelector('.c2').value, p2: intVal(row.querySelector('.p2')),
   });
-  if (ssPairs.length) output.disulfide_bonds = [{ residue_pairs: ssPairs }];
-
-  // ── Bonded atom pairs ───────────────────────────────────────────────────────
-  const bonds = [];
-  document.querySelectorAll('.bond-pair-row').forEach(div => {
-    const ea = div.querySelector('.bond-entity-a')?.value.trim();
-    const ra = parseInt(div.querySelector('.bond-res-a')?.value) || null;
-    const aa = div.querySelector('.bond-atom-a')?.value.trim();
-    const eb = div.querySelector('.bond-entity-b')?.value.trim();
-    const rb = parseInt(div.querySelector('.bond-res-b')?.value) || null;
-    const ab = div.querySelector('.bond-atom-b')?.value.trim();
-    if (ea && ra && aa && eb && rb && ab) bonds.push([[ea, ra, aa], [eb, rb, ab]]);
-  });
-  if (bonds.length) output.bondedAtomPairs = bonds;
-
-  // ── User CCD ────────────────────────────────────────────────────────────────
-  const ccdContent = document.getElementById('userCCD')?.value.trim();
-  const ccdPath    = document.getElementById('userCCDPath')?.value.trim();
-  if (ccdContent && ccdPath) throw new Error('Provide User CCD content OR path, not both.');
-  if (ccdContent) output.userCCD     = ccdContent;
-  if (ccdPath)    output.userCCDPath = ccdPath;
-
-  return output;
+  model.xl = xlGroups().map((g, i) => ({
+    el: g, name: groupName(g),
+    color: xlColors[i % xlColors.length],
+    dash: XL_DASH_PATTERNS[Math.floor(i / xlColors.length) % XL_DASH_PATTERNS.length],
+    pairs: [...g.querySelectorAll('.pair')].map(pairOf),
+  }));
+  model.ss = [...$('ssRows').querySelectorAll('.ss')].map(pairOf);
+  model.bonds = [...$('bondRows').querySelectorAll('.bond')].map(row => ({
+    el: row,
+    a: [row.querySelector('.ca').value, intVal(row.querySelector('.ra')), row.querySelector('.aa-name').value.trim()],
+    b: [row.querySelector('.cb').value, intVal(row.querySelector('.rb')), row.querySelector('.ab-name').value.trim()],
+  }));
+  model.ccd = $('ccdSec').hidden
+    ? { content: '', path: '' }
+    : { el: $('ccdSec'), content: $('userCCD').value.trim(), path: $('userCCDPath').value.trim() };
+  return model;
 }
 
-// ─── Copy JSON ────────────────────────────────────────────────────────────────
+/** Write residue letters, row messages and problem marks back to the page. */
+function annotate(model, issues) {
+  const byId = new Map();
+  model.chains.forEach(c => { if (!byId.has(c.id)) byId.set(c.id, c); });
+  const aa = (id, p) => (p && byId.get(id)?.seq[p - 1]) || '';
 
-function _copyJSON(e) {
-  const text = document.getElementById('jsonOutput').textContent;
-  if (!text || text.startsWith('//')) return;
-  navigator.clipboard.writeText(text).then(() => {
-    const btn = e?.currentTarget || document.getElementById('copyJsonBtn');
-    const orig = btn.textContent;
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = orig; }, 1500);
-  });
-}
+  const inUse = new Set();
+  [...model.xl.flatMap(g => g.pairs), ...model.ss].forEach(p => { if (p.p1) inUse.add(p.c1); if (p.p2) inUse.add(p.c2); });
+  model.bonds.forEach(b => [b.a, b.b].forEach(e => { if (e[1] && e[2]) inUse.add(e[0]); }));
 
-// ─── Arc Diagram Update ───────────────────────────────────────────────────────
-
-let _autoSaveTimer = null;
-
-export function updateViz() {
-  const svg = document.getElementById('arc-svg');
-  if (!svg) return;
-
-  const chains   = _readChainsFromDOM();
-  const xlGroups = _readXlGroupsFromDOM();
-  const ssBonds  = _readSsBondsFromDOM();
-
-  drawArcDiagram(svg, chains, xlGroups, ssBonds);
-  _rewireArcEvents(svg);
-  _updateArcLegend(xlGroups, ssBonds);
-  updateXlStats();
-  _validateAll();
-  _markOutputStale();
-
-
-  // Refresh XL highlights in all visible sequence displays
-  document.querySelectorAll('.seq-card').forEach(card => {
-    const display = card.querySelector('.seq-display');
-    if (display && display.style.display !== 'none') _updateRuler(card);
-  });
-
-  // Debounced auto-save
-  clearTimeout(_autoSaveTimer);
-  _autoSaveTimer = setTimeout(_tryAutoSave, 1500);
-}
-
-function _readChainsFromDOM() {
-  const chains = [];
-  document.querySelectorAll('.seq-card').forEach((card, cardIdx) => {
-    const type     = card.querySelector('.seq-type-label')?.textContent.toLowerCase() || 'protein';
-    const chainRaw  = card.querySelector('.seq-chain-id')?.value.trim() || '';
-    const color     = card.dataset.color || chainColorForType(type, cardIdx);
-    const seqTA     = card.querySelector('.seq-textarea');
-    const seqLen    = seqTA ? (seqTA.value.trim().replace(/\s/g,'').length || 0) : 0;
-
-    const ids = chainRaw.includes(',')
-      ? chainRaw.split(',').map(s => s.trim()).filter(Boolean)
-      : chainRaw ? [chainRaw] : [];
-
-    ids.forEach(id => {
-      chains.push({ id, label: id, length: seqLen || null, color, type });
-    });
-  });
-  return chains;
-}
-
-function _readXlGroupsFromDOM() {
-  const groups = [];
-  let pairIdx  = 0;  // global counter — gives each pair a unique color
-  document.querySelectorAll('.xl-group-card').forEach((card, gi) => {
-    const xlId   = card.dataset.id;
-    const xlSel  = card.querySelector('.xl-select');
-    let   xlName = xlSel?.value || '';
-    const xl     = CROSSLINKERS.find(x => x.name === xlName);
-    if (xl?.dynamic) {
-      const n = parseInt(card.querySelector('.xl-dyn-n-input')?.value) || 5;
-      xlName  = xlName + n;
-    }
-
-    const groupColor = XL_GROUP_COLORS[gi % XL_GROUP_COLORS.length];
-    const dashArray  = XL_DASH_PATTERNS[gi % XL_DASH_PATTERNS.length];
-    const pairs = [];
-
-    card.querySelectorAll('.xl-pair-row').forEach(row => {
-      const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-      const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || null;
-      const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-      const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || null;
-      if (c1 && p1 && c2 && p2) {
-        const color = XL_GROUP_COLORS[pairIdx % XL_GROUP_COLORS.length];
-        pairs.push({ chain1: c1, pos1: p1, chain2: c2, pos2: p2, color, dashArray });
-        pairIdx++;
-      }
-    });
-
-    if (pairs.length) groups.push({ name: xlName, color: groupColor, dashArray, pairs });
-  });
-  return groups;
-}
-
-function _readSsBondsFromDOM() {
-  const bonds = [];
-  document.querySelectorAll('.ss-pair-row').forEach(row => {
-    const c1 = row.querySelector('.ss-chain-a')?.value.trim();
-    const p1 = parseInt(row.querySelector('.ss-pos-a')?.value) || null;
-    const c2 = row.querySelector('.ss-chain-b')?.value.trim();
-    const p2 = parseInt(row.querySelector('.ss-pos-b')?.value) || null;
-    if (c1 && p1 && c2 && p2) bonds.push({ chain1: c1, pos1: p1, chain2: c2, pos2: p2 });
-  });
-  return bonds;
-}
-
-function _updateArcLegend(xlGroups, ssBonds) {
-  const el = document.getElementById('arc-legend');
-  if (!el) return;
-
-  const hasSS = ssBonds && ssBonds.length > 0;
-  const hasMultiXL = xlGroups && xlGroups.length >= 2;
-  if (!hasSS && !hasMultiXL) { el.innerHTML = ''; return; }
-
-  const _svgLine = (color, dash) =>
-    `<svg width="36" height="12" style="vertical-align:middle;margin:0 4px 0 2px">` +
-    `<line x1="2" y1="6" x2="34" y2="6" stroke="${color}" stroke-width="2.5"` +
-    (dash && dash !== 'none' ? ` stroke-dasharray="${dash}"` : '') + `/></svg>`;
-
-  let html = '';
-  if (hasMultiXL) {
-    html += '<span class="arc-legend-label">Crosslinker groups:</span>';
-    xlGroups.forEach(grp => {
-      html += `<span class="arc-legend-item">${_svgLine(grp.color || '#9aa0a6', grp.dashArray)}${grp.name || '—'}</span>`;
-    });
+  for (const c of model.chains) {
+    c.el._features = inUse.has(c.id) || c.mods.length > 0 || c.msa.mode !== 'auto' || c.tpl.mode !== 'auto';
+    c.el.classList.toggle('editable', c.type !== 'ligand' && !c.el._features);
+    const len = c.el.querySelector('.chain-len');
+    len.textContent = c.type === 'ligand' ? '' : (c.seq ? `${c.seq.length} ${UNIT[c.type]}` : '');
+    c.el.querySelector('.chain-edit').hidden = c.type === 'ligand' || c.el.querySelector('.seq-view').hidden;
+    c.mods.forEach(m => { m.el.querySelector('.chip-at').textContent = ` ${c.seq[m.pos - 1] || ''}${m.pos}`; });
   }
-  if (hasSS) {
-    if (html) html += '<span class="arc-legend-sep">·</span>';
-    html += `<span class="arc-legend-item">${_svgLine('#f0b400', '5 3')}Disulfide (S–S)</span>`;
-  }
-  el.innerHTML = html;
-}
 
-// ─── Batch export / Screening ─────────────────────────────────────────────────
-
-/** Extract all crosslink pairs from the DOM as flat objects. */
-function _getAllCrosslinkPairs() {
-  const all = [];
-  document.querySelectorAll('.xl-group-card').forEach(card => {
-    const xlSel = card.querySelector('.xl-select');
-    let xlName  = xlSel?.value || 'DSSO';
-    const xl    = CROSSLINKERS.find(x => x.name === xlName);
-    if (xl?.dynamic) {
-      const n = parseInt(card.querySelector('.xl-dyn-n-input')?.value) || 5;
-      xlName  = xlName + n;
+  let nPairs = 0, nInter = 0;
+  for (const g of model.xl) {
+    g.el.querySelector('.dot').style.background = g.color;
+    g.el.style.setProperty('--g', g.color);
+    let n = 0;
+    for (const p of g.pairs) {
+      p.el.querySelector('.a1').textContent = aa(p.c1, p.p1);
+      p.el.querySelector('.a2').textContent = aa(p.c2, p.p2);
+      const res = checkPair(p, g.name, byId);
+      const msg = p.el.querySelector('.row-msg');
+      msg.textContent = res.state === 'error' ? res.msg : res.state === 'swap' ? '⇄' : '';
+      msg.title = res.state === 'swap' ? 'Written in reverse order in the JSON: the NHS-ester end goes first' : '';
+      msg.classList.toggle('info', res.state === 'swap');
+      if (res.state === 'ok' || res.state === 'swap') { n++; nPairs++; if (p.c1 !== p.c2) nInter++; }
     }
-    card.querySelectorAll('.xl-pair-row').forEach(row => {
-      const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-      const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || null;
-      const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-      const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || null;
-      if (c1 && p1 && c2 && p2) all.push({ xlName, pair: [[c1, p1], [c2, p2]] });
-    });
+    g.el.querySelector('.xl-count').textContent = g.pairs.length > 3 ? `${n}` : '';
+    g.el.classList.toggle('active', g.el === activeXl && model.xl.length > 1);
+  }
+  $('xlSummary').textContent = nPairs > 1 ? `${nPairs} · ${nInter} inter · ${nPairs - nInter} intra` : '';
+  const anySeq = model.chains.some(c => c.type === 'protein' && c.seq);
+  $('xlHint').hidden = !anySeq || nPairs > 0;
+
+  for (const b of model.ss) {
+    b.el.querySelector('.a1').textContent = aa(b.c1, b.p1);
+    b.el.querySelector('.a2').textContent = aa(b.c2, b.p2);
+  }
+
+  document.querySelectorAll('.has-error, .has-warn').forEach(el => el.classList.remove('has-error', 'has-warn'));
+  document.querySelectorAll('.row.ss .row-msg, .row.bond .row-msg').forEach(el => { el.textContent = ''; });
+  for (const it of issues) {
+    if (!it.el?.classList) continue;
+    if (it.level === 'todo' && !nagged) continue;
+    it.el.classList.add(it.level === 'warn' ? 'has-warn' : 'has-error');
+    if (it.level === 'error' && it.el.classList.contains('opt')) it.el.hidden = false;
+    if (it.level === 'error' && it.el.matches('.row.ss, .row.bond')) {
+      it.el.querySelector('.row-msg').textContent = it.msg.replace(/^[^:]*: /, '');
+    }
+  }
+}
+
+function syncSections(model) {
+  $('ssSec').hidden = !model.ss.length;
+  $('bondSec').hidden = !model.bonds.length;
+}
+
+// ─── Output ──────────────────────────────────────────────────────────────────
+
+function renderIssues(issues) {
+  const box = $('issues');
+  const order = { error: 0, todo: 1, warn: 2 };
+  const sorted = [...issues].sort((a, b) => order[a.level] - order[b.level]);
+  const blocked = issues.some(i => i.level !== 'warn');
+  box.innerHTML = '';
+  const MAX = 6;
+  sorted.forEach((it, i) => {
+    const b = document.createElement('button');
+    b.className = `issue ${it.level}`;
+    b.textContent = it.msg;
+    if (i >= MAX) b.hidden = true;
+    if (it.el) b.addEventListener('click', () => reveal(it.el));
+    else b.disabled = true;
+    box.appendChild(b);
   });
-  return all;
-}
-
-/** Group [{xlName, pair}] → [{name: xlName, residue_pairs: [...]}] for JSON output. */
-function _groupByXLName(items) {
-  const map = new Map();
-  for (const { xlName, pair } of items) {
-    if (!map.has(xlName)) map.set(xlName, []);
-    map.get(xlName).push(pair);
+  if (sorted.length > MAX) {
+    const more = document.createElement('button');
+    more.className = 'issue more';
+    more.textContent = `${sorted.length - MAX} more`;
+    more.addEventListener('click', () => { box.querySelectorAll('[hidden]').forEach(b => { b.hidden = false; }); more.remove(); });
+    box.appendChild(more);
   }
-  return [...map.entries()].map(([name, residue_pairs]) => ({ name, residue_pairs }));
+  if (!blocked) nagged = false;
+  ['downloadBtn', 'downloadMoreBtn', 'copyBtn'].forEach(id => {
+    $(id).classList.toggle('blocked', blocked);
+    $(id).setAttribute('aria-disabled', blocked);
+  });
 }
 
-/** Build a complete JSON but replace the crosslinks field with the given groups. */
-function _buildJSONWithXL(xlGroups) {
-  const out = _buildJSON();
-  if (xlGroups && xlGroups.length) {
-    out.crosslinks = xlGroups;
-  } else {
-    delete out.crosslinks;
-  }
-  return out;
+const isBlocked = () => current.issues.some(i => i.level !== 'warn');
+
+/** Download was pressed with open items: mark and flash every place that needs input. */
+function showBlockers() {
+  nagged = true;
+  refresh();
+  const open = current.issues.filter(i => i.level !== 'warn');
+  open.forEach(i => { if (i.el?.classList) { const opt = i.el.closest('.opt'); if (opt) opt.hidden = false; flash(i.el); } });
+  flash($('issues'));
+  const first = open.find(i => i.el);
+  if (first) reveal(first.el);
 }
 
-/** Create and trigger download of a ZIP archive. */
-async function _downloadZip(files, zipFilename) {
-  const { default: JSZip } = await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm');
-  const zip = new JSZip();
-  files.forEach(f => zip.file(f.name, f.content));
-  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = zipFilename;
+/** Scroll to an element, flash it and focus its first field. */
+function reveal(el) {
+  if (!el?.isConnected) return;
+  const opt = el.closest('.opt');
+  if (opt) opt.hidden = false;
+  const sec = el.closest('.sec');
+  if (sec) sec.hidden = false;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  flash(el);
+  let f = el.matches('input, select, textarea') ? el : null;
+  if (!f && el.classList.contains('chain')) f = el.querySelector('.seq-edit:not([hidden]), .lig-row:not([hidden]) .lig-input');
+  if (!f) f = [...el.querySelectorAll('input:not([type=file]), select, textarea')].find(x => x.offsetParent !== null && !x.disabled);
+  f?.focus({ preventScroll: true });
+}
+
+function flash(el) {
+  el.classList.remove('flash');
+  void el.offsetWidth;
+  el.classList.add('flash');
+}
+
+function renderJson() {
+  if (!$('jsonDetails').open) return;
+  const short = (k, v) => (typeof v === 'string' && v.length > 400
+    ? `${v.slice(0, 60)}… (${v.length.toLocaleString('en')} characters)` : v);
+  let text = JSON.stringify(current.json, short, 2);
+  // one residue pair or bond per line
+  text = text.replace(/\[\s*\[\s*("[^"]*"),\s*(\d+)(?:,\s*("[^"]*"))?\s*\],\s*\[\s*("[^"]*"),\s*(\d+)(?:,\s*("[^"]*"))?\s*\]\s*\]/g,
+    (m, a, b, c, d, e, f) => `[[${a}, ${b}${c ? `, ${c}` : ''}], [${d}, ${e}${f ? `, ${f}` : ''}]]`);
+  text = text.replace(/"modelSeeds": \[([\s\d,]+)\]/, (m, s) => `"modelSeeds": [${s.replace(/\s+/g, ' ').trim()}]`);
+  $('jsonOut').textContent = text;
+}
+
+const jsonText = () => JSON.stringify(current.json, null, 2);
+
+function download(filename, text, type = 'application/json') {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: filename });
   document.body.appendChild(a);
   a.click();
-  document.body.removeChild(a);
+  a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-async function _batchSingleXL() {
-  const btn = document.getElementById('batchSingleBtn');
-  btn.disabled = true;
-  btn.textContent = 'Building…';
+const safeName = name => name.replace(/[^\w.+-]+/g, '_') || 'af3x_job';
+
+async function copyJson() {
   try {
-    const allPairs = _getAllCrosslinkPairs();
-    if (!allPairs.length) { alert('No crosslink pairs loaded.'); return; }
-
-    const base    = _buildJSON();  // validates required fields, throws on error
-    const jobName = base.name || 'job';
-
-    const files = allPairs.map(({ xlName, pair }) => {
-      const label = `${xlName}_${pair[0][0]}${pair[0][1]}-${pair[1][0]}${pair[1][1]}`;
-      const json  = _buildJSONWithXL([{ name: xlName, residue_pairs: [pair] }]);
-      json.name   = `${jobName}_${label}`;
-      return { name: `${jobName}_${label}.json`, content: JSON.stringify(json, null, 2) };
-    });
-
-    await _downloadZip(files, `${jobName}_single_xl.zip`);
-  } catch (e) {
-    alert('Error: ' + e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Download ZIP';
+    await navigator.clipboard.writeText(jsonText());
+    const b = $('copyBtn');
+    b.textContent = 'Copied';
+    setTimeout(() => { b.textContent = 'Copy'; }, 1400);
+  } catch {
+    toast('Copying is blocked by the browser', { type: 'error' });
   }
 }
 
-async function _batchRandomCombos() {
-  const btn = document.getElementById('batchComboBtn');
-  btn.disabled = true;
-  btn.textContent = 'Building…';
-  try {
-    const allPairs = _getAllCrosslinkPairs();
-    const k = parseInt(document.getElementById('batchComboK').value) || 5;
-    const m = parseInt(document.getElementById('batchComboM').value) || 20;
+// ── Diagram ──────────────────────────────────────────────────────────────────
 
-    if (!allPairs.length) { alert('No crosslink pairs loaded.'); return; }
-    if (k > allPairs.length) {
-      alert(`k=${k} exceeds available pairs (${allPairs.length}). Reduce k.`);
-      return;
+function diagramData(model) {
+  const chains = model.chains.filter(c => c.id).map(c => ({
+    id: c.id, label: c.id, length: c.type === 'ligand' ? null : (c.seq.length || null), color: c.color, type: c.type,
+  }));
+  const done = p => p.c1 && p.p1 && p.c2 && p.p2;
+  const groups = model.xl.map(g => ({
+    name: g.name, color: g.color, dashArray: g.dash,
+    pairs: g.pairs.filter(done).map(p => ({ chain1: p.c1, pos1: p.p1, chain2: p.c2, pos2: p.p2, color: g.color, dashArray: g.dash })),
+  })).filter(g => g.pairs.length);
+  const ss = model.ss.filter(done).map(p => ({ chain1: p.c1, pos1: p.p1, chain2: p.c2, pos2: p.p2 }));
+  return { chains, groups, ss };
+}
+
+function drawDiagram(model) {
+  const { chains, groups, ss } = diagramData(model);
+  document.querySelector('.diagram').hidden = !chains.some(c => c.length);
+  drawArcDiagram($('arc-svg'), chains, groups, ss);
+  const legend = $('arc-legend');
+  const line = (color, dash) => `<svg width="22" height="8" aria-hidden="true"><line x1="1" y1="4" x2="21" y2="4" stroke="${color}" stroke-width="2"${dash && dash !== 'none' ? ` stroke-dasharray="${dash}"` : ''}/></svg>`;
+  let html = '';
+  if (groups.length > 1) html += groups.map(g => `<span>${line(g.color, g.dashArray)}${esc(g.name)}</span>`).join('');
+  if (ss.length) html += `<span>${line(cssVar('--ss'), '4 3')}S–S</span>`;
+  legend.innerHTML = html;
+}
+
+function pairRowByKey(key) {
+  const [c1, p1, c2, p2] = key.split(':');
+  return [...document.querySelectorAll('.row.pair, .row.ss')].find(r =>
+    r.querySelector('.c1').value === c1 && r.querySelector('.p1').value === p1 &&
+    r.querySelector('.c2').value === c2 && r.querySelector('.p2').value === p2) || null;
+}
+
+/** Light up everything that shows one pair: row, residues, arc. */
+function setHot(row, on) {
+  document.querySelectorAll('.hot').forEach(el => el.classList.remove('hot'));
+  if (!on || !row) return;
+  row.classList.add('hot');
+  const pid = row.dataset.pid;
+  document.querySelectorAll(`.r[data-k~="${pid}"]`).forEach(el => el.classList.add('hot'));
+  const key = ['.c1', '.p1', '.c2', '.p2'].map(s => row.querySelector(s).value).join(':');
+  document.querySelectorAll(`.xl-arc-group[data-key="${CSS.escape(key)}"]`).forEach(el => el.classList.add('hot'));
+}
+
+function showTip(html, e) {
+  const tip = $('arc-tooltip');
+  tip.innerHTML = html;
+  tip.style.display = 'block';
+  moveTip(e);
+}
+
+function moveTip(e) {
+  const tip = $('arc-tooltip');
+  if (tip.style.display !== 'block') return;
+  const w = tip.offsetWidth;
+  tip.style.left = `${Math.min(e.clientX + 14, window.innerWidth - w - 8)}px`;
+  tip.style.top = `${Math.max(4, e.clientY - 34)}px`;
+}
+
+function hideTip() {
+  $('arc-tooltip').style.display = 'none';
+}
+
+// ─── Autosave ────────────────────────────────────────────────────────────────
+
+let _saveTimer = null;
+
+function scheduleSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    const json = current.json;
+    if (!json) return;
+    try {
+      localStorage.setItem(LS_STATE, JSON.stringify(json));
+    } catch {
+      // too large for local storage: keep everything but the uploaded files
+      try {
+        localStorage.setItem(LS_STATE, JSON.stringify(json, (k, v) => (typeof v === 'string' && v.length > 20000 ? '' : v)));
+      } catch { /* storage unavailable */ }
     }
+  }, 600);
+}
 
-    const base    = _buildJSON();
-    const jobName = base.name || 'job';
-    const files   = [];
+function isBlank(json) {
+  if (!json) return true;
+  const seqs = json.sequences || [];
+  const empty = seqs.every(s => { const d = Object.values(s)[0]; return !d.sequence && !d.ccdCodes?.length && !d.smiles; });
+  return !json.name && empty && seqs.length <= 1 && !json.crosslinks && !json.disulfide_bonds && !json.bondedAtomPairs;
+}
 
+function restoreSession() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(LS_STATE)); } catch { /* ignore */ }
+  if (!saved || detectJsonDialect(saved) !== 'af3x' || isBlank(saved)) return false;
+  try {
+    loadJson(saved);
+    return true;
+  } catch (e) {
+    console.warn('restore failed', e);
+    clearAll();
+    return false;
+  }
+}
+
+// ─── Loading and clearing ────────────────────────────────────────────────────
+
+function clearAll() {
+  clearPending();
+  ['chains', 'xlGroups', 'ssRows', 'bondRows'].forEach(id => { $(id).innerHTML = ''; });
+  activeXl = null;
+  $('jobName').value = '';
+  setSeeds([1]);
+  version = 4;
+  $('ccdSec').hidden = true;
+  $('userCCD').value = '';
+  $('userCCDPath').value = '';
+  syncCcd();
+}
+
+function setSeeds(seeds) {
+  const list = (Array.isArray(seeds) ? seeds : [1]).map(Number).filter(n => Number.isInteger(n) && n >= 0);
+  const isRun = list.length > 0 && list.every((n, i) => n === i + 1);
+  setSeedMode(isRun || !list.length ? 'count' : 'list');
+  $('seedCount').value = isRun ? list.length : 1;
+  $('seedList').value = isRun ? '' : list.join(', ');
+}
+
+function setSeedMode(mode) {
+  seedMode = mode;
+  $('seedCount').hidden = mode !== 'count';
+  $('seedList').hidden = mode !== 'list';
+  document.querySelector('.field.seeds').classList.toggle('wide', mode === 'list');
+}
+
+/** One `sequences` entry → one chain card per ID. */
+function addChainFromEntry(obj, opts = {}) {
+  const type = Object.keys(obj)[0];
+  if (!TYPE_LABEL[type]) return;
+  const d = obj[type] || {};
+  const ids = opts.newId ? [null] : [].concat(d.id ?? [null]);
+  let after = opts.after || null;
+  for (const id of ids) {
+    const card = addChain(type, {
+      id: typeof id === 'string' && /^[A-Z]+$/.test(id) ? id : undefined,
+      label: d.description, sequence: d.sequence, ccd: d.ccdCodes, smiles: d.smiles,
+    }, { after });
+    after = after ? card : null;
+    if (type === 'ligand') continue;
+    for (const m of d.modifications || []) addMod(card, m.ptmType || m.modificationType, m.ptmPosition || m.basePosition);
+    if (type !== 'dna') {
+      const slots = type === 'protein' ? ['unpaired', 'paired'] : ['unpaired'];
+      const given = slots.filter(s => d[`${s}Msa`] != null || d[`${s}MsaPath`]);
+      const filled = slots.filter(s => d[`${s}Msa`] || d[`${s}MsaPath`]);
+      if (filled.length) {
+        setMode(card, 'msa', 'custom');
+        for (const s of filled) {
+          const input = card.querySelector(`.file-row[data-slot="${s}"] .msa-path`);
+          if (d[`${s}MsaPath`]) input.value = d[`${s}MsaPath`];
+          else setInline(input, 'MSA in the JSON', d[`${s}Msa`]);
+        }
+      } else if (given.length) {
+        setMode(card, 'msa', 'none');
+      }
+    }
+    if (type === 'protein' && Array.isArray(d.templates)) {
+      if (!d.templates.length) setMode(card, 'tpl', 'none');
+      else {
+        card.dataset.tpl = 'custom';
+        d.templates.forEach(t => addTpl(card, t));
+        setMode(card, 'tpl', 'custom');
+      }
+    }
+  }
+}
+
+function loadJson(j) {
+  clearAll();
+  $('jobName').value = j.name || '';
+  setSeeds(j.modelSeeds);
+  version = [1, 2, 3, 4].includes(Number(j.version)) ? Number(j.version) : 4;
+  for (const obj of j.sequences || []) addChainFromEntry(obj);
+  for (const g of j.crosslinks || []) {
+    addXlGroup({ name: g.name, pairs: (g.residue_pairs || []).map(p => ({ c1: p[0][0], p1: p[0][1], c2: p[1][0], p2: p[1][1] })) });
+  }
+  for (const g of j.disulfide_bonds || []) {
+    for (const p of g.residue_pairs || []) addSs({ c1: p[0][0], p1: p[0][1], c2: p[1][0], p2: p[1][1] });
+  }
+  for (const b of j.bondedAtomPairs || []) addBond({ a: b[0], b: b[1] });
+  if (j.userCCD || j.userCCDPath) showCcd(j.userCCD || '', j.userCCDPath || '');
+  if (!chainCards().length) addChain('protein', {}, { guess: true });
+  refreshChainSels();
+  touch();
+}
+
+/** Replace the whole job, offering Undo. */
+function replaceJob(json, message) {
+  const before = isBlank(current.json) ? null : JSON.parse(JSON.stringify(current.json));
+  loadJson(json);
+  toast(message, before ? { action: { label: 'Undo', fn: () => loadJson(before) } } : {});
+}
+
+function newJob() {
+  if (isBlank(current.json)) return;
+  replaceJob({ sequences: [] }, 'Cleared');
+}
+
+// ─── Importing files ─────────────────────────────────────────────────────────
+
+async function handleFile(file) {
+  let text;
+  try { text = await readFileText(file); } catch { toast(`Could not read ${file.name}`, { type: 'error' }); return; }
+  const kind = sniffFile(file.name, text);
+  if (kind === 'json') importJsonText(text, file.name);
+  else if (kind === 'structure') openPdbModal(text, onStructureImport);
+  else if (kind === 'csv') importCsv(text);
+  else if (kind === 'fasta') importFasta(text);
+  else toast(`${file.name}: not a FASTA, PDB/mmCIF, JSON or crosslink CSV file`, { type: 'error' });
+}
+
+function importJsonText(text, name) {
+  let raw;
+  try { raw = JSON.parse(text); } catch (e) { toast(`${name}: not valid JSON`, { type: 'error' }); return; }
+  const dialect = detectJsonDialect(raw);
+  if (dialect === 'af3x') {
+    replaceJob(raw, `Opened ${name}`);
+  } else if (dialect === 'alphafoldserver') {
+    const { converted, notes } = convertServerJson(raw);
+    replaceJob(converted, `Opened AlphaFold Server job ${name}`);
+    notes.forEach(n => toast(n, { ms: 9000 }));
+  } else {
+    toast(`${name}: not an AlphaFold 3 or AlphaFold Server input`, { type: 'error' });
+  }
+}
+
+function importFasta(text) {
+  const entries = parseFasta(text);
+  if (!entries.length) { toast('No sequence found in the file', { type: 'error' }); return; }
+  if (entries.length <= 10) { addSeqEntries(entries); return; }
+  $('fastaSummary').textContent = plural(entries.length, 'sequence');
+  $('fastaList').innerHTML = entries.map((e, i) => `
+    <label class="pick-row">
+      <input type="checkbox" value="${i}" checked>
+      <span class="pick-main">${esc(shortHeader(e.header) || `Sequence ${i + 1}`)}</span>
+      <span class="pick-sub">${e.seq.length}</span>
+    </label>`).join('');
+  $('fastaConfirm').onclick = () => {
+    const chosen = [...$('fastaList').querySelectorAll('input:checked')].map(cb => entries[+cb.value]);
+    hideModal('fasta-modal');
+    if (chosen.length) addSeqEntries(chosen);
+  };
+  showModal('fasta-modal');
+}
+
+function onStructureImport(chains) {
+  for (const ch of chains) {
+    const type = ['dna', 'rna', 'ligand'].includes(ch.type) ? ch.type : 'protein';
+    if (type === 'ligand') {
+      addChain('ligand', { ccd: ch.ccdCode });
+      continue;
+    }
+    const spare = chainCards().find(c => c.dataset.type !== 'ligand' && !c._seq &&
+      !c.querySelector('.seq-edit').value.trim() && !c.querySelector('.chain-label').value);
+    const card = spare || addChain(type);
+    if (card.dataset.type !== type) setType(card, type);
+    card._guess = false;
+    fillChain(card, ch.sequence || '', (ch.entityName || '').slice(0, 40));
+  }
+  refreshChainSels();
+  touch();
+}
+
+function importCsv(text) {
+  const chains = collect().chains.filter(c => c.type === 'protein').map(c => ({ id: c.id, label: c.label, hasSeq: !!c.seq }));
+  openImportModal(text, onCsvImport, chains, nextFreeIds);
+}
+
+/** n chain IDs that are not in use. */
+function nextFreeIds(n) {
+  const used = new Set(chainCards().map(cardId));
+  const out = [];
+  for (let i = 0; out.length < n; i++) if (!used.has(intToId(i))) out.push(intToId(i));
+  return out;
+}
+
+function onCsvImport(pairs, xlName, proteinToChain, sequences = {}) {
+  for (const [prot, id] of Object.entries(proteinToChain)) {
+    let card = cardByChainId(id);
+    if (card && card.dataset.type !== 'protein') continue;
+    if (!card) {
+      const spare = chainCards().find(c => c.dataset.type === 'protein' && !c._seq &&
+        !c.querySelector('.seq-edit').value.trim() && !c.querySelector('.chain-label').value &&
+        !Object.values(proteinToChain).includes(cardId(c)));
+      if (spare) {
+        spare.querySelector('.chain-id').value = id;
+        spare._id = id;
+        card = spare;
+      } else {
+        card = addChain('protein', { id });
+      }
+    }
+    const lab = card.querySelector('.chain-label');
+    if (!lab.value) lab.value = shortProteinName(prot).slice(0, 40);
+    if (!card._seq && sequences[prot]) setSeq(card, sequences[prot]);
+  }
+  refreshChainSels();
+  const g = addXlGroup({
+    name: xlName,
+    pairs: pairs.map(p => ({ c1: proteinToChain[p.protein1], p1: p.pos1, c2: proteinToChain[p.protein2], p2: p.pos2 })),
+  });
+  toast(`Imported ${plural(pairs.length, 'crosslink')}`);
+  g.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function pickFile(inputId) {
+  const input = $(inputId);
+  input.value = '';
+  input.click();
+}
+
+// ─── Batch export ────────────────────────────────────────────────────────────
+
+function allPairs() {
+  return (current.json?.crosslinks || []).flatMap(g => g.residue_pairs.map(pair => ({ name: g.name, pair })));
+}
+
+function openBatch() {
+  if (isBlocked()) { showBlockers(); return; }
+  if (allPairs().length < 2) { toast('Batch export needs at least two crosslinks'); return; }
+  syncBatch();
+  showModal('batch-modal');
+}
+
+function syncBatch() {
+  const n = allPairs().length;
+  $('batchK').max = n;
+  if (intVal($('batchK')) > n) $('batchK').value = Math.max(1, Math.min(5, n - 1));
+  const k = intVal($('batchK')), m = intVal($('batchM'));
+  $('batchCount').textContent = plural(n, 'crosslink');
+  $('batchSingleInfo').textContent = `${plural(n, 'file')}`;
+  const combo = document.querySelector('input[name="batchMode"]:checked').value === 'combo';
+  const bad = combo && (k < 1 || k > n || m < 1);
+  const note = $('batchNote');
+  note.hidden = !bad;
+  note.textContent = bad ? `Crosslinks per job must be between 1 and ${n}` : '';
+  $('batchGo').disabled = bad;
+}
+
+async function runBatch() {
+  const base = current.json;
+  const pairs = allPairs();
+  const mode = document.querySelector('input[name="batchMode"]:checked').value;
+  const job = safeName(base.name);
+  const variant = (name, chosen) => {
+    const byName = new Map();
+    chosen.forEach(({ name: n, pair }) => { if (!byName.has(n)) byName.set(n, []); byName.get(n).push(pair); });
+    const j = { ...base, name, crosslinks: [...byName].map(([n, residue_pairs]) => ({ name: n, residue_pairs })) };
+    return { name: `${name}.json`, content: JSON.stringify(j, null, 2) };
+  };
+  let files, zipName;
+  if (mode === 'single') {
+    files = pairs.map(p => variant(`${job}_${p.name}_${p.pair[0].join('')}-${p.pair[1].join('')}`, [p]));
+    zipName = `${job}_single_xl.zip`;
+  } else {
+    const k = intVal($('batchK')), m = intVal($('batchM'));
+    files = [];
     for (let i = 0; i < m; i++) {
-      // Fisher-Yates partial shuffle to pick k random items
-      const pool = [...allPairs];
+      const pool = [...pairs];
       for (let j = 0; j < k; j++) {
         const r = j + Math.floor(Math.random() * (pool.length - j));
         [pool[j], pool[r]] = [pool[r], pool[j]];
       }
-      const chosen   = pool.slice(0, k);
-      const xlGroups = _groupByXLName(chosen);
-      const json     = _buildJSONWithXL(xlGroups);
-      const label    = `${jobName}_combo_${String(i + 1).padStart(3, '0')}`;
-      json.name      = label;
-      files.push({ name: `${label}.json`, content: JSON.stringify(json, null, 2) });
+      files.push(variant(`${job}_combo_${String(i + 1).padStart(3, '0')}`, pool.slice(0, k)));
     }
-
-    await _downloadZip(files, `${jobName}_combos_k${k}_n${m}.zip`);
+    zipName = `${job}_combos_k${k}_n${m}.zip`;
+  }
+  const btn = $('batchGo');
+  btn.disabled = true;
+  try {
+    const { default: JSZip } = await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm');
+    const zip = new JSZip();
+    files.forEach(f => zip.file(f.name, f.content));
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement('a'), { href: url, download: zipName });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    hideModal('batch-modal');
   } catch (e) {
-    alert('Error: ' + e.message);
+    toast('Could not build the ZIP (is the network blocked?)', { type: 'error' });
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Download ZIP';
   }
 }
 
-/** Refresh batch export info labels (called on panel open and input changes). */
-function _updateBatchInfo() {
-  const n          = _getAllCrosslinkPairs().length;
-  const singleInfo = document.getElementById('batchSingleInfo');
-  if (singleInfo) {
-    singleInfo.textContent = `${n} pair${n !== 1 ? 's' : ''} → ${n} JSON file${n !== 1 ? 's' : ''}`;
+// ─── Advanced options menu ───────────────────────────────────────────────────
+
+/** Run fn(card) on the one matching chain, or ask which. */
+function withChain(anchor, filter, title, fn) {
+  const cards = chainCards().filter(filter);
+  if (!cards.length) { toast('Add a matching chain first'); return; }
+  if (cards.length === 1) { fn(cards[0]); return; }
+  openMenu(anchor, cards.map(c => ({
+    label: `${cardId(c)}  ${c.querySelector('.chain-label').value}`.trim(),
+    hint: `${TYPE_LABEL[c.dataset.type]}${c._seq ? ` · ${c._seq.length}` : ''}`,
+    onClick: () => fn(c),
+  })), { title, cls: 'palette' });
+}
+
+function openPalette() {
+  const a = $('paletteBtn');
+  const polymer = c => c.dataset.type !== 'ligand';
+  const protein = c => c.dataset.type === 'protein';
+  const msaOk = c => c.dataset.type === 'protein' || c.dataset.type === 'rna';
+  const mode = (kind, m) => card => { setMode(card, kind, m, true); reveal(card.querySelector(`.opt-${kind}`)); };
+  const items = [
+    { heading: 'Add' },
+    { label: 'Disulfide bond', hint: 'Cys–Cys', keys: 'ss s-s cysteine bridge disulphide', onClick: () => reveal(addSs()) },
+    { label: 'Modification', hint: 'PTM or modified base', keys: 'ptm phospho methyl acetyl ccd', onClick: () => withChain(a, polymer, 'Modify which chain?', startMod) },
+    { label: 'Bonded atom pair', hint: 'Covalent ligand, glycan', keys: 'bond covalent bondedAtomPairs', onClick: () => reveal(addBond()) },
+    { label: 'Custom ligand definition', hint: 'Your own CCD mmCIF', keys: 'userCCD userCCDPath ligand cif', onClick: () => { $('ccdSec').hidden = false; touch(); reveal($('ccdSec')); } },
+    { heading: 'MSA and templates' },
+    { label: 'Run without MSA', hint: 'Per chain', keys: 'msa none single sequence unpairedMsa', onClick: () => withChain(a, msaOk, 'No MSA for which chain?', mode('msa', 'none')) },
+    { label: 'Custom MSA', hint: 'Your own A3M', keys: 'msa a3m alignment unpairedMsa pairedMsa', onClick: () => withChain(a, msaOk, 'Custom MSA for which chain?', mode('msa', 'custom')) },
+    { label: 'Run without templates', hint: 'Per chain', keys: 'template none', onClick: () => withChain(a, protein, 'No templates for which chain?', mode('tpl', 'none')) },
+    { label: 'Custom template', hint: 'Your own PDB / mmCIF', keys: 'template structure pdb mmcif', onClick: () => withChain(a, protein, 'Template for which chain?', mode('tpl', 'custom')) },
+    { heading: 'Job' },
+    { label: 'Exact seed values', hint: seedMode === 'list' ? 'On' : 'Instead of 1…N', keys: 'seeds modelSeeds random', onClick: () => { setSeedMode('list'); touch(); reveal($('seedList')); } },
+    { label: 'JSON version', hint: `Now ${version}`, keys: 'version dialect old', onClick: () => openJobMenu() },
+    { heading: 'Import' },
+    { label: 'AlphaFold 3 / AlphaFold Server JSON', hint: 'Open a job', keys: 'import open load json', onClick: () => pickFile('anyFileInput') },
+    { label: 'FASTA, PDB or mmCIF', hint: 'Chains from a file', keys: 'import fasta pdb cif structure sequence', onClick: () => pickFile('chainFileInput') },
+    { label: 'Crosslink CSV', hint: 'xiVIEW, xiNET', keys: 'import csv xiview xinet xl-ms', onClick: () => pickFile('csvFileInput') },
+    { heading: 'Export' },
+    { label: 'One job per crosslink', hint: 'ZIP', keys: 'batch export zip screening single', onClick: () => { document.querySelector('input[name="batchMode"][value="single"]').checked = true; openBatch(); } },
+    { label: 'Random crosslink subsets', hint: 'ZIP', keys: 'batch export zip screening combinations sample', onClick: () => { document.querySelector('input[name="batchMode"][value="combo"]').checked = true; openBatch(); } },
+    { heading: 'Page' },
+    { label: 'Light / dark theme', keys: 'theme colour color', onClick: toggleTheme },
+    { label: 'Help', keys: 'about guide documentation privacy credits', onClick: openHelp },
+  ];
+  openMenu(a, items, { search: true, placeholder: 'Search options', cls: 'palette' });
+}
+
+function openJobMenu() {
+  const box = document.createElement('div');
+  box.className = 'form-pop';
+  box.innerHTML = `
+    <div class="form-row"><span>Seeds</span>
+      <div class="seg" id="seedSeg"><button data-v="count" title="Seeds 1, 2, … N">1…N</button><button data-v="list" title="Type the seed values">Exact</button></div>
+    </div>
+    <div class="form-row"><span>JSON version</span>
+      <select id="versionSel" title="Use a lower version only for an old AlphaFold 3 installation">${[4, 3, 2, 1].map(v => `<option${v === version ? ' selected' : ''}>${v}</option>`).join('')}</select>
+    </div>`;
+  const seg = box.querySelector('#seedSeg');
+  const paint = () => seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === seedMode));
+  paint();
+  seg.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    setSeedMode(b.dataset.v);
+    paint();
+    touch();
+  });
+  box.querySelector('#versionSel').addEventListener('change', e => { version = parseInt(e.target.value, 10); touch(); });
+  openPopover($('jobMoreBtn'), box, { align: 'right' });
+}
+
+// ─── Help and theme ──────────────────────────────────────────────────────────
+
+function openHelp() {
+  const wrap = $('helpXlTable');
+  if (!wrap.firstChild) {
+    const rows = CROSSLINKERS.map(x => {
+      const react = x.dynamic ? 'any'
+        : x.symmetric ? x.reactiveResidues.join(' ')
+        : `${x.reactiveResidues[0].join(' ')} → any`;
+      return `<tr><td><b>${esc(x.name)}${x.dynamic ? '<i>n</i>' : ''}</b></td><td>${esc(react)}</td><td>${esc(x.description)}</td></tr>`;
+    }).join('');
+    wrap.innerHTML = `<table class="help-table"><thead><tr><th>Name</th><th>Residues</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
   }
-
-  const k         = parseInt(document.getElementById('batchComboK')?.value) || 5;
-  const m         = parseInt(document.getElementById('batchComboM')?.value) || 20;
-  const comboInfo = document.getElementById('batchComboInfo');
-  if (!comboInfo) return;
-  if (n === 0) {
-    comboInfo.textContent  = 'No crosslink pairs loaded.';
-    comboInfo.style.color  = 'var(--warning)';
-  } else if (k > n) {
-    comboInfo.textContent  = `⚠ k=${k} exceeds available pairs (${n}) — reduce k`;
-    comboInfo.style.color  = 'var(--warning)';
-  } else {
-    const coverage = n > 0 ? ((k / n) * 100).toFixed(0) : 0;
-    comboInfo.textContent  = `${m} jobs × ${k} XLs each  (${coverage}% of ${n} pairs per job)`;
-    comboInfo.style.color  = '';
-  }
+  showModal('help-modal');
 }
 
-// ─── Arc click ↔ pair row highlight + zoom ───────────────────────────────────
-
-let _zoomRaf = null;
-
-function _rewireArcEvents(svg) {
-  const tooltip = document.getElementById('arc-tooltip');
-
-  svg.querySelectorAll('.xl-arc-group').forEach(group => {
-    const key   = group.getAttribute('data-key');
-    const label = group.getAttribute('data-label');
-
-    // Click → flash matching pair row
-    group.addEventListener('click', () => {
-      const [c1, p1, c2, p2] = key.split(':');
-      let found = null;
-      document.querySelectorAll('.xl-pair-row').forEach(row => {
-        if (row.querySelector('.xl-chain-a')?.value.trim() === c1 &&
-            String(row.querySelector('.xl-pos-a')?.value).trim() === p1 &&
-            row.querySelector('.xl-chain-b')?.value.trim() === c2 &&
-            String(row.querySelector('.xl-pos-b')?.value).trim() === p2) {
-          found = row;
-        }
-      });
-      if (found) {
-        found.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        found.classList.remove('xl-row-flash');
-        void found.offsetWidth;
-        found.classList.add('xl-row-flash');
-      }
-    });
-
-    // Hover → show tooltip
-    group.addEventListener('mouseenter', () => {
-      if (tooltip) { tooltip.textContent = label; tooltip.style.display = 'block'; }
-    });
-
-    group.addEventListener('mousemove', e => {
-      if (tooltip) {
-        tooltip.style.left = (e.clientX + 16) + 'px';
-        tooltip.style.top  = (e.clientY - 32) + 'px';
-      }
-    });
-
-    group.addEventListener('mouseleave', () => {
-      if (tooltip) tooltip.style.display = 'none';
-    });
-  });
+function toggleTheme() {
+  const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem(LS_THEME, next); } catch { /* ignore */ }
+  touch();
 }
 
-function _zoomToGroup(svg, group) {
-  const fullVb = svg.dataset.fullVb;
-  if (!fullVb) return;
-  const [, , vw, vh] = fullVb.split(' ').map(Number);
+// ─── Wiring ──────────────────────────────────────────────────────────────────
 
-  let bbox;
-  try { bbox = group.getBBox(); } catch { return; }
+function initChains() {
+  const box = $('chains');
 
-  const PAD = 90;
-  let tx = bbox.x - PAD;
-  let ty = bbox.y - PAD;
-  let tw = bbox.width  + PAD * 2;
-  let th = bbox.height + PAD * 2;
-
-  // Clamp to SVG bounds
-  if (tx < 0)          { tw += tx;     tx = 0; }
-  if (ty < 0)          { th += ty;     ty = 0; }
-  if (tx + tw > vw)    { tw = vw - tx;        }
-  if (ty + th > vh)    { th = vh - ty;        }
-
-  // Skip zoom if area is already ≥ 80% of the diagram
-  if (tw / vw > 0.80 && th / vh > 0.80) return;
-
-  _smoothViewBox(svg, [tx, ty, tw, th], 220);
-}
-
-function _restoreViewBox(svg) {
-  const fullVb = svg.dataset.fullVb;
-  if (!fullVb) return;
-  _smoothViewBox(svg, fullVb.split(' ').map(Number), 200);
-}
-
-function _smoothViewBox(svg, target, durationMs) {
-  const vb    = svg.viewBox.baseVal;
-  const start = [vb.x, vb.y, vb.width, vb.height];
-  const t0    = performance.now();
-
-  if (_zoomRaf) cancelAnimationFrame(_zoomRaf);
-
-  function step(t) {
-    const raw  = Math.min((t - t0) / durationMs, 1);
-    const ease = raw < 0.5 ? 4 * raw ** 3 : 1 - (-2 * raw + 2) ** 3 / 2;
-
-    const x = start[0] + (target[0] - start[0]) * ease;
-    const y = start[1] + (target[1] - start[1]) * ease;
-    const w = start[2] + (target[2] - start[2]) * ease;
-    const h = start[3] + (target[3] - start[3]) * ease;
-    svg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
-
-    if (raw < 1) {
-      _zoomRaf = requestAnimationFrame(step);
-    } else {
-      _zoomRaf = null;
-    }
-  }
-
-  _zoomRaf = requestAnimationFrame(step);
-}
-
-export function wireXlPairRowHover(row) {
-  row.addEventListener('mouseenter', () => {
-    const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-    const p1 = row.querySelector('.xl-pos-a')?.value.trim();
-    const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-    const p2 = row.querySelector('.xl-pos-b')?.value.trim();
-    if (!c1 || !p1 || !c2 || !p2) return;
-    const key = `${c1}:${p1}:${c2}:${p2}`;
-    document.querySelectorAll(`.xl-arc-group[data-key="${CSS.escape(key)}"]`).forEach(grp => {
-      grp.classList.add('xl-arc-group-hover');
-    });
-  });
-  row.addEventListener('mouseleave', () => {
-    document.querySelectorAll('.xl-arc-group.xl-arc-group-hover').forEach(grp => {
-      grp.classList.remove('xl-arc-group-hover');
-    });
-  });
-}
-
-// ─── Validation ───────────────────────────────────────────────────────────────
-
-function _validateAll() {
-  _checkDuplicateChainIds();
-  _checkXlPositions();
-}
-
-function _checkDuplicateChainIds() {
-  const seen = {};
-  document.querySelectorAll('.seq-card').forEach(card => {
-    const input = card.querySelector('.seq-chain-id');
-    if (!input) return;
-    const val = input.value.trim();
-    if (!val) return;
-    // Multi-chain (comma-separated)
-    val.split(',').map(s => s.trim()).filter(Boolean).forEach(id => {
-      if (!seen[id]) seen[id] = [];
-      seen[id].push(input);
-    });
-  });
-
-  document.querySelectorAll('.seq-chain-id').forEach(input => {
-    const warn = input.closest('.seq-chain-id-wrap')?.querySelector('.chain-id-dup-warn');
-    const ids  = (input.value.trim()).split(',').map(s => s.trim()).filter(Boolean);
-    const isDup = ids.some(id => seen[id] && seen[id].length > 1);
-    if (warn) warn.style.display = isDup ? 'inline' : 'none';
-    input.classList.toggle('input-warning', isDup);
-  });
-}
-
-function _checkXlPositions() {
-  // Build chain → sequence maps
-  const chainLen  = {};
-  const chainSeq  = {};
-  const allChains = new Set();   // every defined chain ID, with or without a sequence yet
-  document.querySelectorAll('.seq-card').forEach(card => {
-    const chainRaw = card.querySelector('.seq-chain-id')?.value.trim() || '';
-    chainRaw.split(',').map(s => s.trim()).filter(Boolean).forEach(id => allChains.add(id));
-    const seq      = card.querySelector('.seq-textarea')?.value.replace(/\s/g, '').toUpperCase() || '';
-    if (!seq) return;
-    chainRaw.split(',').map(s => s.trim()).filter(Boolean).forEach(id => {
-      chainLen[id] = seq.length;
-      chainSeq[id] = seq;
-    });
-  });
-
-  // Build duplicate-position map: "chain:pos" → count across all pairs
-  const posUsage = {};
-  document.querySelectorAll('.xl-pair-row').forEach(row => {
-    const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-    const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || 0;
-    const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-    const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || 0;
-    if (c1 && p1) posUsage[`${c1}:${p1}`] = (posUsage[`${c1}:${p1}`] || 0) + 1;
-    if (c2 && p2) posUsage[`${c2}:${p2}`] = (posUsage[`${c2}:${p2}`] || 0) + 1;
-  });
-
-  document.querySelectorAll('.xl-pair-row').forEach(row => {
-    const posWarn  = row.querySelector('.xl-pos-warn');
-    const chemWarn = row.querySelector('.xl-chem-warn');
-    const c1 = row.querySelector('.xl-chain-a')?.value.trim();
-    const p1 = parseInt(row.querySelector('.xl-pos-a')?.value) || 0;
-    const c2 = row.querySelector('.xl-chain-b')?.value.trim();
-    const p2 = parseInt(row.querySelector('.xl-pos-b')?.value) || 0;
-
-    // Undefined chain IDs, then position bounds
-    let posMsg = '';
-    const missing = [...new Set([c1, c2].filter(c => c && !allChains.has(c)))];
-    if (missing.length) {
-      posMsg = `chain${missing.length > 1 ? 's' : ''} ${missing.join(', ')} not defined in sequences`;
-    } else if (c1 && p1 && chainLen[c1] && p1 > chainLen[c1]) {
-      posMsg = `${c1}: pos ${p1} > len ${chainLen[c1]}`;
-    } else if (c2 && p2 && chainLen[c2] && p2 > chainLen[c2]) {
-      posMsg = `${c2}: pos ${p2} > len ${chainLen[c2]}`;
-    }
-
-    // Duplicate position check — each residue may appear in at most one XL pair
-    if (!posMsg) {
-      const dups = [];
-      if (c1 && p1 && posUsage[`${c1}:${p1}`] > 1) dups.push(`${c1}:${p1}`);
-      if (c2 && p2 && posUsage[`${c2}:${p2}`] > 1) dups.push(`${c2}:${p2}`);
-      if (dups.length) posMsg = `residue${dups.length > 1 ? 's' : ''} ${dups.join(', ')} used in multiple pairs`;
-    }
-
-    if (posWarn) {
-      posWarn.textContent   = posMsg ? `⚠ ${posMsg}` : '';
-      posWarn.style.display = posMsg ? 'inline' : 'none';
-    }
-
-    // Chemical compatibility
-    if (chemWarn) {
-      const xlCard = row.closest('.xl-group-card');
-      const xlName = xlCard?.querySelector('.xl-select')?.value;
-      const xl     = CROSSLINKERS.find(x => x.name === xlName);
-      let chemMsg  = '';
-      let isInfo   = false;
-
-      if (xl && !xl.dynamic && c1 && p1 && c2 && p2) {
-        const isOk = (chain, pos, reactive) => {
-          if (!reactive || reactive.includes('any AA')) return true;
-          const seq = chainSeq[chain];
-          if (!seq) return true;
-          const aa = seq[pos - 1];
-          if (!aa) return true;
-          return reactive.includes(aa) || (pos === 1 && reactive.includes('N-term'));
-        };
-
-        const fmtR = r => {
-          const aas = r.filter(x => x !== 'N-term').join('/');
-          return r.includes('N-term') ? `${aas}/N-term` : aas;
-        };
-        if (xl.symmetric) {
-          const r = xl.reactiveResidues;
-          const bad = [];
-          if (!isOk(c1, p1, r)) {
-            const aa = chainSeq[c1]?.[p1 - 1] || '?';
-            bad.push(`${c1}:${aa}${p1} not reactive [${fmtR(r)}]`);
-          }
-          if (!isOk(c2, p2, r)) {
-            const aa = chainSeq[c2]?.[p2 - 1] || '?';
-            bad.push(`${c2}:${aa}${p2} not reactive [${fmtR(r)}]`);
-          }
-          chemMsg = bad.join(' · ');
-        } else {
-          // Asymmetric: check both forward and reversed order
-          const end1 = xl.reactiveResidues[0];
-          const end2 = xl.reactiveResidues[1];
-          const fwdOk = isOk(c1, p1, end1) && isOk(c2, p2, end2);
-          const revOk = isOk(c2, p2, end1) && isOk(c1, p1, end2);
-          if (fwdOk) {
-            chemMsg = ''; // correct order
-          } else if (revOk) {
-            chemMsg = '↔ order will be auto-corrected on export';
-            isInfo  = true;
-          } else {
-            // Neither order works
-            const aa1 = chainSeq[c1]?.[p1 - 1] || '?';
-            const aa2 = chainSeq[c2]?.[p2 - 1] || '?';
-            const allowed = fmtR(end1);
-            if (!isOk(c1, p1, end1) && !isOk(c2, p2, end1)) {
-              chemMsg = `neither position has END1-reactive residue [${allowed}]`;
-            } else {
-              chemMsg = !isOk(c1, p1, end1)
-                ? `${c1}:${aa1}${p1} needs END1-reactive [${allowed}]`
-                : `${c2}:${aa2}${p2} needs END2-reactive`;
-            }
-          }
-        }
-      }
-
-      chemWarn.textContent = chemMsg ? (isInfo ? `ℹ ${chemMsg}` : `⚠ ${chemMsg}`) : '';
-      chemWarn.style.display = chemMsg ? 'inline' : 'none';
-      chemWarn.classList.toggle('is-info', isInfo);
-    }
-  });
-}
-
-// ─── Reset / clear all ───────────────────────────────────────────────────────
-
-export function resetAll() {
-  if (!confirm('Clear everything and start fresh?')) return;
-
-  // Sequences
-  document.getElementById('sequences-container').innerHTML = '';
-
-  // Crosslinks
-  document.getElementById('crosslinks-container').innerHTML = '';
-
-  // Disulfide bonds
-  document.getElementById('ss-bonds-container').innerHTML = '';
-
-  // Bonded atom pairs
-  document.getElementById('bonds-container').innerHTML = '';
-
-  // Header fields
-  document.getElementById('jobName').value    = '';
-  document.querySelectorAll('.seed-seg-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.mode === 'count');
-  });
-  document.getElementById('seedCount').style.display    = '';
-  document.getElementById('seedSpecific').style.display = 'none';
-  document.getElementById('seedCount').value            = '1';
-
-  // JSON output + stale banner
-  document.getElementById('jsonOutput').innerHTML =
-    '<span class="json-placeholder">// Click "Generate JSON" to build output</span>';
-  document.getElementById('expandJsonBtn').style.display  = 'none';
-  document.getElementById('copyJsonBtn').style.display    = 'none';
-  document.getElementById('downloadJsonLink').style.display = 'none';
-  const valPanel = document.getElementById('json-validation-panel');
-  if (valPanel) { valPanel.innerHTML = ''; valPanel.style.display = 'none'; }
-  _clearOutputStale();
-  _hasGeneratedOnce = false;
-
-  // Clear localStorage
-  localStorage.removeItem(LS_KEY);
-  localStorage.removeItem(LS_TIME_KEY);
-  const banner = document.getElementById('restoreBanner');
-  if (banner) banner.style.display = 'none';
-
-  // Start fresh with one empty protein card
-  addSequenceCard('protein');
-  _updateSeqCount();
-  updateViz();
-}
-
-// ─── localStorage auto-save / restore ────────────────────────────────────────
-
-const LS_KEY      = 'af3x_autosave';
-const LS_TIME_KEY = 'af3x_autosave_time';
-
-function _tryAutoSave() {
-  try {
-    const json = _buildJSON();
-    localStorage.setItem(LS_KEY, JSON.stringify(json));
-    localStorage.setItem(LS_TIME_KEY, new Date().toISOString());
-  } catch { /* ignore if form is incomplete */ }
-}
-
-function _checkRestoreSession() {
-  const saved = localStorage.getItem(LS_KEY);
-  const time  = localStorage.getItem(LS_TIME_KEY);
-  if (!saved) return;
-
-  const banner = document.getElementById('restoreBanner');
-  if (!banner) return;
-
-  const when = time ? new Date(time).toLocaleString() : 'previously';
-  banner.querySelector('#restoreBannerTime').textContent = when;
-  banner.style.display = 'flex';
-
-  document.getElementById('restoreSessionBtn').addEventListener('click', () => {
-    try {
-      const json = JSON.parse(saved);
-      _populateFromJSON(json);
-      banner.style.display = 'none';
-    } catch (e) {
-      alert('Could not restore session: ' + e.message);
-    }
-  });
-
-  document.getElementById('dismissRestoreBtn').addEventListener('click', () => {
-    banner.style.display = 'none';
-    localStorage.removeItem(LS_KEY);
-    localStorage.removeItem(LS_TIME_KEY);
-  });
-}
-
-// ─── PDB / mmCIF import ───────────────────────────────────────────────────────
-
-function _handlePdbFile(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    openPdbModal(ev.target.result, _onPdbImport);
-  };
-  reader.readAsText(file);
-  e.target.value = '';
-}
-
-function _onPdbImport(chains) {
-  // Find the initial empty card (if any) to reuse for the first chain
-  const allCards  = document.querySelectorAll('#sequences-container .seq-card');
-  const lastCard  = allCards[allCards.length - 1];
-  const lastTa    = lastCard?.querySelector('.seq-textarea');
-  const emptyCard = (lastCard && lastTa && !lastTa.value.trim()) ? lastCard : null;
-
-  // Collect existing IDs, but exclude the empty card's ID so it can be reassigned
-  const emptyCardId = emptyCard?.querySelector('.seq-chain-id')?.value.trim() || null;
-  const existingIds = new Set();
-  document.querySelectorAll('.seq-chain-id').forEach(el => {
-    (el.value || '').split(',').map(s => s.trim()).filter(Boolean).forEach(id => {
-      if (id !== emptyCardId) existingIds.add(id);
-    });
-  });
-
-  let nextCharCode = 65; // 'A'
-  function _nextFreeId() {
-    while (existingIds.has(String.fromCharCode(nextCharCode)) && nextCharCode < 91) nextCharCode++;
-    const id = nextCharCode < 91 ? String.fromCharCode(nextCharCode) : `Z${nextCharCode - 90}`;
-    existingIds.add(id);
-    nextCharCode++;
-    return id;
-  }
-
-  chains.forEach((chain, idx) => {
-    const type = chain.type === 'dna' ? 'dna'
-               : chain.type === 'rna' ? 'rna'
-               : chain.type === 'ligand' ? 'ligand'
-               : 'protein';
-
-    let card;
-    if (idx === 0 && emptyCard) {
-      card = emptyCard; // reuse the initial empty card
-    } else {
-      addSequenceCard(type);
-      card = document.querySelector('#sequences-container .seq-card:last-child');
-    }
+  box.addEventListener('click', e => {
+    const card = e.target.closest('.chain');
     if (!card) return;
+    const hit = sel => e.target.closest(sel);
+    let b;
+    if (hit('.chain-del')) removeChain(card);
+    else if ((b = hit('.chain-more'))) openChainMenu(card, b);
+    else if ((b = hit('.chain-type'))) openTypeMenu(card, b);
+    else if (hit('.chain-edit')) editSeq(card);
+    else if (hit('.fetch-btn')) commitSeq(card);
+    else if ((b = hit('.lig-kind button'))) { setLigKind(card, b.dataset.v); touch(); }
+    else if ((b = hit('.seg[data-seg] button'))) setMode(card, b.parentElement.dataset.seg, b.dataset.v, true);
+    else if ((b = hit('.opt-x'))) setMode(card, b.closest('.opt').classList.contains('opt-msa') ? 'msa' : 'tpl', 'auto');
+    else if (hit('.chip-add')) startMod(card);
+    else if ((b = hit('.chip-x'))) {
+      b.closest('.chip').remove();
+      if (!card.querySelector('.mod-chip')) card.querySelector('.opt-mods').hidden = true;
+      touch();
+    }
+    else if (hit('.add-tpl')) addTpl(card);
+    else if ((b = hit('.tpl-x'))) { b.closest('.tpl').remove(); touch(); }
+    else if ((b = hit('.r'))) onResidueClick(card, b);
+    else if (hit('.seq-view') && !pending && !card._features) editSeq(card);
+  });
 
-    const chainIdInput = card.querySelector('.seq-chain-id');
-    if (chainIdInput) chainIdInput.value = _nextFreeId();
+  box.addEventListener('dblclick', e => {
+    const card = e.target.closest('.chain');
+    if (!card || !e.target.closest('.seq-view') || card._features) return;
+    const r = e.target.closest('.r');
+    editSeq(card, r ? parseInt(r.dataset.p, 10) : null);
+  });
 
-    if (type === 'ligand') {
-      // Switch to CCD tab and set the code
-      const ccdBtn = card.querySelector('[data-tab="ccd"]');
-      const smilesBtn = card.querySelector('[data-tab="smiles"]');
-      if (ccdBtn) ccdBtn.click();
-      const ccdInput = card.querySelector('.ligand-ccd');
-      if (ccdInput && chain.ccdCode) ccdInput.value = chain.ccdCode;
-    } else {
-      const ta = card.querySelector('.seq-textarea');
-      if (ta && chain.sequence) {
-        ta.value = chain.sequence;
-        const typeName = type === 'dna' ? 'dna' : type === 'rna' ? 'rna' : 'protein';
-        _autoValidateSeq(ta, typeName);
-        _updateRuler(card);
-      }
+  box.addEventListener('input', e => {
+    const card = e.target.closest('.chain');
+    if (!card) return;
+    const t = e.target;
+    if (t.classList.contains('seq-edit')) onSeqInput(card, t);
+    else if (t.classList.contains('chain-id')) onChainIdInput(card, t);
+  });
+
+  box.addEventListener('beforeinput', e => {
+    const t = e.target;
+    if (t._inline != null && t.matches('.msa-path, .tpl-path')) { t.value = ''; clearInline(t); }
+  });
+
+  box.addEventListener('change', async e => {
+    const card = e.target.closest('.chain');
+    const t = e.target;
+    if (!card) return;
+    if (t.type === 'file' && t.files[0]) {
+      const file = t.files[0];
+      t.value = '';
+      const tpl = t.closest('.tpl');
+      if (tpl) await onTplFile(card, tpl, file);
+      else await onMsaFile(card, t.closest('.file-row'), file);
+    } else if (t.classList.contains('tpl-chain')) {
+      useTplChain(card, t.closest('.tpl'), parseInt(t.value, 10));
     }
   });
 
-  updateViz();
-}
+  box.addEventListener('paste', e => {
+    const t = e.target;
+    if (!t.classList?.contains('seq-edit')) return;
+    const card = t.closest('.chain');
+    if (!t.value.trim()) setTimeout(() => commitSeq(card), 0);
+  });
 
-// ─── Theme toggle (light / dark) ───────────────────────────────────────────────
+  box.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const t = e.target;
+    if (t.classList.contains('seq-edit')) { e.preventDefault(); commitSeq(t.closest('.chain')); }
+    else if (t.matches('.chain-id, .chain-label')) t.blur();
+  });
 
-const THEME_KEY = 'af3x_theme';
+  box.addEventListener('focusout', e => {
+    const t = e.target;
+    if (!t.classList?.contains('seq-edit')) return;
+    const card = t.closest('.chain');
+    if (e.relatedTarget?.closest?.('.seq-msg')) return;
+    setTimeout(() => { if (document.activeElement !== t) commitSeq(card); }, 0);
+  });
 
-function _initThemeToggle() {
-  const btn = document.getElementById('themeToggleBtn');
-  if (!btn) return;
-  _applyThemeIcon(document.documentElement.getAttribute('data-theme') || 'dark');
-  btn.addEventListener('click', () => {
-    const current = document.documentElement.getAttribute('data-theme') || 'dark';
-    const next = current === 'light' ? 'dark' : 'light';
-    document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem(THEME_KEY, next);
-    _applyThemeIcon(next);
+  // residue tooltip and pair highlight
+  box.addEventListener('mouseover', e => {
+    const r = e.target.closest('.r');
+    if (!r) { hideTip(); return; }
+    const card = r.closest('.chain');
+    const p = parseInt(r.dataset.p, 10);
+    const tips = card._tips?.get(p) || [];
+    showTip(`<b>${r.textContent}${p}</b>${tips.map(t => `<span>${esc(t)}</span>`).join('')}`, e);
+    const pid = (r.dataset.k || '').split(' ')[0];
+    setHot(pid ? document.querySelector(`.row[data-pid="${pid}"]`) : null, !!pid);
+  });
+  box.addEventListener('mousemove', moveTip);
+  box.addEventListener('mouseleave', () => { hideTip(); setHot(null, false); });
+
+  // drag to reorder
+  let dragged = null;
+  box.addEventListener('mousedown', e => {
+    const card = e.target.closest('.chain');
+    if (card) card.draggable = !!e.target.closest('.grip');
+  });
+  box.addEventListener('dragstart', e => {
+    const card = e.target.closest?.('.chain');
+    if (!card?.draggable) return;
+    dragged = card;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', cardId(card));
+  });
+  box.addEventListener('dragover', e => {
+    if (!dragged) return;
+    const card = e.target.closest('.chain');
+    if (!card || card === dragged) return;
+    e.preventDefault();
+    const r = card.getBoundingClientRect();
+    if (e.clientY < r.top + r.height / 2) card.before(dragged);
+    else card.after(dragged);
+  });
+  box.addEventListener('dragend', () => {
+    if (!dragged) return;
+    dragged.classList.remove('dragging');
+    dragged.draggable = false;
+    dragged = null;
+    refreshChainSels();
+    touch();
   });
 }
 
-function _applyThemeIcon(theme) {
-  const btn = document.getElementById('themeToggleBtn');
-  if (!btn) return;
-  btn.textContent = theme === 'light' ? '🌙' : '☀️';
-  btn.title = theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
-}
-
-// ─── Intro / overview banner ───────────────────────────────────────────────────
-// Always present (not dismissible) — only collapsible, so the quick overview
-// stays available rather than disappearing forever after one click.
-
-function _initIntroBanner() {
-  const banner = document.getElementById('introBanner');
-  if (!banner) return;
-
-  const body        = document.getElementById('introBannerBody');
-  const collapseBtn = document.getElementById('introCollapseBtn');
-
-  collapseBtn.addEventListener('click', () => {
-    const collapsed = body.style.display === 'none';
-    body.style.display      = collapsed ? '' : 'none';
-    collapseBtn.textContent = collapsed ? 'Hide details ▾' : 'Show details ▸';
+function initRows() {
+  const xl = $('xlGroups');
+  xl.addEventListener('click', e => {
+    const g = e.target.closest('.xl');
+    if (!g) return;
+    activeXl = g;
+    if (e.target.closest('.xl-del')) { g.remove(); activeXl = null; }
+    else if (e.target.closest('.xl-add')) addXlPair(g).querySelector('.p1').focus();
+    touch();
   });
-}
+  xl.addEventListener('focusin', e => {
+    const g = e.target.closest('.xl');
+    if (g && g !== activeXl) { activeXl = g; touch(); }
+  });
+  xl.addEventListener('change', e => {
+    if (e.target.classList.contains('xl-name')) syncXlHead(e.target.closest('.xl'));
+  });
+  xl.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' || !e.target.classList.contains('pos')) return;
+    const row = e.target.closest('.pair');
+    if (e.target.classList.contains('p1')) { row.querySelector('.p2').focus(); return; }
+    const next = row.nextElementSibling || addXlPair(row.closest('.xl'));
+    next.querySelector('.p1').focus();
+  });
+  xl.addEventListener('paste', e => {
+    const row = e.target.closest?.('.pair');
+    if (!row) return;
+    const pairs = parsePairLines(e.clipboardData?.getData('text') || '');
+    if (!pairs) return;
+    e.preventDefault();
+    const g = row.closest('.xl');
+    if (!row.querySelector('.p1').value && !row.querySelector('.p2').value) row.remove();
+    pairs.forEach(p => addXlPair(g, p, false));
+    refreshChainSels(g);
+    touch();
+  });
 
-function _syncUserCcdExclusivity() {
-  const content = document.getElementById('userCCD');
-  const path     = document.getElementById('userCCDPath');
-  if (!content || !path) return;
-  path.disabled    = content.value.trim().length > 0;
-  content.disabled = path.value.trim().length > 0;
-}
+  // shared by crosslink, disulfide and bond rows
+  document.addEventListener('click', e => {
+    const x = e.target.closest('.row-x');
+    if (!x) return;
+    x.closest('.row').remove();
+    touch();
+  });
+  document.addEventListener('change', e => {
+    if (e.target.classList?.contains('chain-sel')) { e.target.dataset.v = e.target.value; touch(); }
+  });
+  document.addEventListener('mouseover', e => {
+    const row = e.target.closest?.('.row.pair, .row.ss');
+    if (row) setHot(row, true);
+    else if (!e.target.closest?.('.r, .xl-arc-group')) setHot(null, false);
+  });
 
-function _initUserCcdExclusivity() {
-  const content = document.getElementById('userCCD');
-  const path     = document.getElementById('userCCDPath');
-  if (!content || !path) return;
-  content.addEventListener('input', _syncUserCcdExclusivity);
-  path.addEventListener('input', _syncUserCcdExclusivity);
+  $('addXlBtn').addEventListener('click', () => addXlGroup().querySelector('.p1').focus());
+  $('addSsBtn').addEventListener('click', () => addSs().querySelector('.p1').focus());
+  $('addBondBtn').addEventListener('click', () => addBond().querySelector('.ra').focus());
 
-  const fileInput = document.getElementById('userCCDFile');
-  fileInput?.addEventListener('change', () => {
-    const file = fileInput.files[0];
+  $('userCCD').addEventListener('input', syncCcd);
+  $('userCCDPath').addEventListener('input', syncCcd);
+  $('userCCDFile').addEventListener('change', async e => {
+    const file = e.target.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = e => {
-      content.value = e.target.result;
-      _syncUserCcdExclusivity();
-    };
-    reader.readAsText(file);
-    fileInput.value = '';
+    $('userCCDPath').value = '';
+    $('userCCD').value = await readFileText(file);
+    e.target.value = '';
+    syncCcd();
+    touch();
+  });
+  $('ccdRemoveBtn').addEventListener('click', () => {
+    $('ccdSec').hidden = true;
+    $('userCCD').value = '';
+    $('userCCDPath').value = '';
+    syncCcd();
+    touch();
   });
 }
 
-// ─── Global tooltips for .label-hint "?" icons ─────────────────────────────────
-// Rendered into a single fixed-position element appended to <body> so they are
-// never clipped by ancestors with overflow:hidden (e.g. .seq-card). Uses event
-// delegation so it also works for hints added dynamically later (templates, mods).
-
-function _initLabelHints() {
-  const tip = document.getElementById('global-tooltip');
-  if (!tip) return;
-
-  document.addEventListener('mouseover', (e) => {
-    const hint = e.target.closest('.label-hint[data-tip]');
-    if (!hint) return;
-    tip.textContent = hint.dataset.tip;
-    tip.classList.add('visible');
-    _positionLabelTooltip(hint, tip);
+function initDiagram() {
+  const svg = $('arc-svg');
+  const groupOf = e => e.target.closest?.('.xl-arc-group');
+  svg.addEventListener('mouseover', e => {
+    const g = groupOf(e);
+    if (!g) { hideTip(); return; }
+    showTip(`<span>${esc(g.getAttribute('data-label'))}</span>`, e);
+    setHot(pairRowByKey(g.getAttribute('data-key')), true);
   });
-
-  document.addEventListener('mouseout', (e) => {
-    const hint = e.target.closest('.label-hint[data-tip]');
-    if (!hint) return;
-    tip.classList.remove('visible');
+  svg.addEventListener('mousemove', moveTip);
+  svg.addEventListener('mouseleave', () => { hideTip(); setHot(null, false); });
+  svg.addEventListener('click', e => {
+    const g = groupOf(e);
+    const row = g && pairRowByKey(g.getAttribute('data-key'));
+    if (row) { row.scrollIntoView({ behavior: 'smooth', block: 'center' }); flash(row); }
   });
-
-  window.addEventListener('scroll', () => tip.classList.remove('visible'), true);
+  $('expandDiagramBtn').addEventListener('click', () => {
+    const { chains, groups, ss } = diagramData(current.model);
+    openInteractiveTopology(chains, groups, ss);
+  });
 }
 
-function _positionLabelTooltip(hint, tip) {
-  const r = hint.getBoundingClientRect();
-  // Measure with visible width (max-width applies once content is set)
-  const tipRect = tip.getBoundingClientRect();
-  let left = r.left + r.width / 2 - tipRect.width / 2;
-  left = Math.max(8, Math.min(left, window.innerWidth - tipRect.width - 8));
-
-  const spaceAbove = r.top;
-  const showBelow  = spaceAbove < tipRect.height + 12;
-  const top = showBelow ? r.bottom + 7 : r.top - tipRect.height - 7;
-
-  tip.style.left = `${left}px`;
-  tip.style.top  = `${top}px`;
+function initDrop() {
+  const overlay = $('dropOverlay');
+  let depth = 0;
+  const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
+  window.addEventListener('dragenter', e => { if (hasFiles(e)) { depth++; overlay.hidden = false; } });
+  window.addEventListener('dragleave', e => { if (hasFiles(e) && --depth <= 0) { depth = 0; overlay.hidden = true; } });
+  window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener('drop', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    overlay.hidden = true;
+    [...e.dataTransfer.files].forEach(handleFile);
+  });
 }
+
+function init() {
+  initModals();
+  initImportModal();
+  initPdbModal();
+  try { initInteractiveTopology(); } catch (e) { console.warn('diagram init', e); }
+  initChains();
+  initRows();
+  initDiagram();
+  initDrop();
+
+  // any edit anywhere → refresh
+  document.addEventListener('input', touch);
+  document.addEventListener('change', touch);
+
+  document.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', () => {
+    const card = addChain(b.dataset.add);
+    card.querySelector('.seq-edit:not([hidden]), .lig-input')?.focus();
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }));
+  $('chainFileBtn').addEventListener('click', () => pickFile('chainFileInput'));
+  $('xlCsvBtn').addEventListener('click', () => pickFile('csvFileInput'));
+  $('importBtn').addEventListener('click', () => pickFile('anyFileInput'));
+  ['anyFileInput', 'chainFileInput'].forEach(id => $(id).addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); }));
+  $('csvFileInput').addEventListener('change', async e => { if (e.target.files[0]) importCsv(await readFileText(e.target.files[0])); });
+
+  $('newBtn').addEventListener('click', newJob);
+  $('helpBtn').addEventListener('click', openHelp);
+  $('themeBtn').addEventListener('click', toggleTheme);
+  $('paletteBtn').addEventListener('click', openPalette);
+  $('jobMoreBtn').addEventListener('click', openJobMenu);
+
+  $('downloadBtn').addEventListener('click', () => {
+    if (isBlocked()) showBlockers();
+    else download(`${safeName(current.json.name)}.json`, jsonText());
+  });
+  $('copyBtn').addEventListener('click', () => (isBlocked() ? showBlockers() : copyJson()));
+  $('downloadMoreBtn').addEventListener('click', e => isBlocked() ? showBlockers() : openMenu(e.currentTarget, [
+    { label: 'One job per crosslink', hint: 'ZIP', onClick: () => { document.querySelector('input[name="batchMode"][value="single"]').checked = true; openBatch(); } },
+    { label: 'Random crosslink subsets', hint: 'ZIP', onClick: () => { document.querySelector('input[name="batchMode"][value="combo"]').checked = true; openBatch(); } },
+  ], { align: 'right' }));
+  $('batch-modal').addEventListener('input', syncBatch);
+  $('batchGo').addEventListener('click', runBatch);
+
+  const details = $('jsonDetails');
+  try { details.open = localStorage.getItem(LS_JSON_OPEN) === '1'; } catch { /* ignore */ }
+  details.addEventListener('toggle', () => {
+    try { localStorage.setItem(LS_JSON_OPEN, details.open ? '1' : '0'); } catch { /* ignore */ }
+    renderJson();
+  });
+
+  $('ptmSearch').addEventListener('input', renderPtm);
+  $('ptmSearch').addEventListener('keydown', e => {
+    if (e.key === 'Enter') $('ptmList').querySelector('.ptm-item')?.click();
+  });
+  $('pickBarCancel').addEventListener('click', clearPending);
+
+  document.addEventListener('keydown', e => {
+    const typing = e.target.matches?.('input, textarea, select') || e.target.isContentEditable;
+    if (e.key === 'Escape') { clearPending(); return; }
+    if (anyModalOpen()) return;
+    if ((e.key === '/' && !typing) || (e.key.toLowerCase() === 'k' && (e.ctrlKey || e.metaKey))) {
+      e.preventDefault();
+      openPalette();
+    }
+  });
+  // starting to type somewhere ends a residue pick
+  document.addEventListener('focusin', e => {
+    if (pending && e.target.matches?.('input, textarea, select') && !e.target.closest('.modal, .popover')) clearPending();
+  });
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(touch, 120);
+  });
+
+  if (restoreSession()) {
+    toast('Restored your last session', { action: { label: 'Start new', fn: newJob }, ms: 6000 });
+  } else {
+    addChain('protein', {}, { guess: true });
+  }
+  refresh();
+  if (location.hash === '#help') openHelp();
+
+  // for automated tests
+  window._testApi = {
+    loadJson,
+    json: () => { refresh(); return current.json; },
+    issues: () => { refresh(); return current.issues.map(i => ({ level: i.level, msg: i.msg })); },
+  };
+}
+
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
